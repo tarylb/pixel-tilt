@@ -364,13 +364,18 @@ def calibrate_pot():
     return new_level, new_left, new_right
 
 
-def level_select(furthest_level, total_levels):
+def level_select(furthest_level, total_levels, best_times=None, format_time=None):
     """Row of numbered boxes, one for every level that exists -- green if
     unlocked (index <= furthest_level), red if locked. Left/right moves
     an underline across ALL of them (locked included, just for browsing);
     a simultaneous press starts the underlined level, but only if it's
-    unlocked. Holding either button for BACK_HOLD_SECONDS backs out to
-    the main menu, returning None instead of a level index."""
+    unlocked. The best recorded time for whichever level is underlined is
+    shown below the row (best_times maps level index -> seconds; "--" if
+    that level has no time yet). Holding either button for
+    BACK_HOLD_SECONDS backs out to the main menu, returning None instead
+    of a level index."""
+    if best_times is None:
+        best_times = {}
     total = total_levels
     box_w = 9
     box_h = 12
@@ -382,6 +387,9 @@ def level_select(furthest_level, total_levels):
     select_tile_grid = displayio.TileGrid(bitmap, pixel_shader=palette)
     select_group = displayio.Group()
     select_group.append(select_tile_grid)
+    time_label = label.Label(terminalio.FONT, text="", color=ui_color(), scale=1)
+    time_label.anchor_point = (0.5, 0.0)
+    select_group.append(time_label)
     display.root_group = select_group
     box_labels = []
 
@@ -412,6 +420,9 @@ def level_select(furthest_level, total_levels):
             lbl.anchored_position = (bx + box_w // 2, top_y + box_h // 2)
             select_group.append(lbl)
             box_labels.append(lbl)
+        best = best_times.get(selected)
+        time_label.text = format_time(best) if best is not None and format_time else "--"
+        time_label.anchored_position = (WIDTH // 2, top_y + box_h + 1)
         display.refresh(minimum_frames_per_second=0)
 
     redraw()

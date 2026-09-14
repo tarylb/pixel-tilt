@@ -231,6 +231,41 @@ def save_progress(level_index):
         return False
 
 
+# ---------- Best-time persistence ----------
+BEST_TIMES_PATH = "/besttimes.txt"
+
+
+def load_best_times():
+    times = {}
+    try:
+        with open(BEST_TIMES_PATH, "r") as f:
+            for line in f.read().strip().split("\n"):
+                if not line:
+                    continue
+                index_s, seconds_s = line.split(",")
+                times[int(index_s)] = float(seconds_s)
+    except OSError:
+        pass
+    return times
+
+
+def save_best_time(level_index, seconds):
+    """Records a new best time for level_index and rewrites the whole
+    file -- see save_brightness() for the read-only-filesystem case."""
+    best_times[level_index] = seconds
+    try:
+        with open(BEST_TIMES_PATH, "w") as f:
+            for index, value in best_times.items():
+                f.write(f"{index},{value}\n")
+        return True
+    except OSError:
+        return False
+
+
+def format_time(seconds):
+    return f"{seconds:.1f}s"
+
+
 menus.init(
     display, group, bitmap, palette, pot, WIDTH, HEIGHT,
     ui_color, apply_brightness, save_brightness, save_calibration,
@@ -248,12 +283,14 @@ bar_pixels_list = []
 score = 0
 ball_rotation = 0.0
 ball_roll_direction = (1.0, 0.0)
+level_start_time = 0.0
+win_label = None
 
 
 def load_level(index):
     global current_level_index, current_start_x, current_start_y
     global spinners, holes, ball_x, ball_y, vel_x, vel_y, ball_pixels, bar_pixels_list, score
-    global ball_rotation, ball_roll_direction
+    global ball_rotation, ball_roll_direction, level_start_time, win_label
 
     current_level_index = index
     current_start_x, current_start_y, spinners, holes = LEVELS[index]()
@@ -264,6 +301,11 @@ def load_level(index):
     score = 0
     ball_rotation = 0.0
     ball_roll_direction = (1.0, 0.0)
+    level_start_time = time.monotonic()
+
+    if win_label is not None:
+        group.remove(win_label)
+        win_label = None
 
     for lbl in hole_labels:
         group.remove(lbl)
@@ -287,8 +329,35 @@ def load_level(index):
     display.refresh(minimum_frames_per_second=0)
 
 
+def mark_level_won():
+    """Called the instant a level is won: records a new best time if this
+    run beat it (or is the first time it's been finished at all), and
+    shows a "NEW BEST" overlay with the time when it did. Returns how
+    long, in seconds, to pause on the win screen before advancing."""
+    global win_label
+    elapsed = time.monotonic() - level_start_time
+    previous_best = best_times.get(current_level_index)
+    is_new_best = previous_best is None or elapsed < previous_best
+    if is_new_best:
+        save_best_time(current_level_index, elapsed)
+        win_label = label.Label(
+            terminalio.FONT,
+            text="NEW BEST\n" + format_time(elapsed),
+            color=ui_color(),
+            scale=1,
+        )
+        win_label.anchor_point = (0.5, 0.5)
+        win_label.anchored_position = (WIDTH // 2, HEIGHT // 2)
+        win_label.line_spacing = 0.9
+        group.append(win_label)
+        display.refresh(minimum_frames_per_second=0)
+        return 2.0
+    return 1.0
+
+
 furthest_level = load_progress()
 furthest_level = max(0, min(furthest_level, len(LEVELS) - 1))
+best_times = load_best_times()
 
 while True:
     menu_choice = menus.main_menu()
@@ -320,7 +389,7 @@ while True:
             time.sleep(1.0)
         continue
     if menu_choice == "select":
-        start_index = menus.level_select(furthest_level, len(LEVELS))
+        start_index = menus.level_select(furthest_level, len(LEVELS), best_times, format_time)
         if start_index is None:
             continue  # backed out of level select
     else:
@@ -382,11 +451,11 @@ while True:
 
         if 0 <= gx < WIDTH and 0 <= gy < HEIGHT and static_color[idx(gx, gy)] == 3:
             won = True
-            win_timer = 1.0
+            win_timer = mark_level_won()
         elif hole_hit is not None:
             score += hole_hit["value"]
             won = True
-            win_timer = 1.0
+            win_timer = mark_level_won()
         elif (
             ball_x < -BALL_RADIUS - 2
             or ball_x > WIDTH + BALL_RADIUS + 2
