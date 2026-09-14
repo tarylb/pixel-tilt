@@ -15,7 +15,7 @@ A tilt-maze game for a 64x32 RGB LED matrix, controlled by tilting a potentiomet
 ## Repo layout
 
 - [circuitpython/code.py](circuitpython/code.py) — the game itself (runs on the board)
-- [circuitpython/boot.py](circuitpython/boot.py) — grants the board write access to save progress on normal power-up; hold the left button while plugging in power to keep the drive writable from your computer instead
+- [circuitpython/boot.py](circuitpython/boot.py) — grants the board write access to save progress on normal power-up; hold either button (or both) while plugging in power to keep the drive writable from your computer instead
 - [circuitpython/levels_data.py](circuitpython/levels_data.py) — level layouts, edited via the level editor rather than by hand
 - [circuitpython/lib/](circuitpython/lib/) — CircuitPython libraries required on the board (`adafruit_display_text`)
 - [tools/level_editor.py](tools/level_editor.py) — desktop pygame tool for building and playtesting levels
@@ -24,7 +24,7 @@ A tilt-maze game for a 64x32 RGB LED matrix, controlled by tilting a potentiomet
 
 1. Copy `circuitpython/code.py`, `circuitpython/boot.py`, `circuitpython/levels_data.py`, and the contents of `circuitpython/lib/` onto `CIRCUITPY`.
 2. Power up normally to play — progress is saved to `/progress.txt` on the board.
-3. To edit files from your computer again, hold the left button while plugging in power (progress won't save during that session).
+3. To edit files from your computer again, hold either button (or both) while plugging in power (progress won't save during that session).
 
 ## Level editor
 
