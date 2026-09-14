@@ -14,7 +14,9 @@ A tilt-maze game for a 64x32 RGB LED matrix, controlled by tilting a potentiomet
 
 ## Repo layout
 
-- [circuitpython/code.py](circuitpython/code.py) — the game itself (runs on the board)
+- [circuitpython/code.py](circuitpython/code.py) — the game itself: hardware setup, persistence, and the main loop (runs on the board)
+- [circuitpython/menus.py](circuitpython/menus.py) — button input handling and all the menu/UI screens (main menu, level select, calibration, brightness, reset confirmation), imported by `code.py`
+- [circuitpython/physics.py](circuitpython/physics.py) — the shared collision/physics engine, imported by both `code.py` and the level editor so a physics change only has to be made once
 - [circuitpython/boot.py](circuitpython/boot.py) — grants the board write access to save progress on normal power-up; hold either button (or both) while plugging in power to keep the drive writable from your computer instead
 - [circuitpython/levels_data.py](circuitpython/levels_data.py) — level layouts, edited via the level editor rather than by hand
 - [circuitpython/lib/](circuitpython/lib/) — CircuitPython libraries required on the board (`adafruit_display_text`)
@@ -22,7 +24,7 @@ A tilt-maze game for a 64x32 RGB LED matrix, controlled by tilting a potentiomet
 
 ## Setting up the board
 
-1. Copy `circuitpython/code.py`, `circuitpython/boot.py`, `circuitpython/levels_data.py`, and the contents of `circuitpython/lib/` onto `CIRCUITPY`.
+1. Copy `circuitpython/code.py`, `circuitpython/menus.py`, `circuitpython/physics.py`, `circuitpython/boot.py`, `circuitpython/levels_data.py`, and the contents of `circuitpython/lib/` onto `CIRCUITPY`.
 2. Power up normally to play — progress is saved to `/progress.txt` on the board.
 3. To edit files from your computer again, hold either button (or both) while plugging in power (progress won't save during that session).
 
@@ -34,7 +36,7 @@ Run with:
 python tools/level_editor.py
 ```
 
-Requires `pygame`. It's a plain desktop tool (not CircuitPython) that shares the same geometry and physics code as the on-device game, so what you build and playtest here matches what runs on the board.
+Requires `pygame`. It's a plain desktop tool (not CircuitPython) that imports `circuitpython/physics.py`, the same collision/physics engine the on-device game uses, so what you build and playtest here matches what runs on the board.
 
 **Mode**
 - `Tab` — toggle Edit / Play

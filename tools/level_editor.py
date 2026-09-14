@@ -4,11 +4,11 @@ number of levels, unlimited spinners, and point-value holes, saving/
 loading level data to levels_data.py.
 
 This is NOT the CircuitPython game itself -- it's a plain-Python/
-pygame tool for building and playtesting level layouts. It uses the
-same geometry representation and physics as the device game, so what
-you build and playtest here matches what runs on the board. The
-device game maintains its own code separately and just imports
-whatever LEVELS_DATA you save here.
+pygame tool for building and playtesting level layouts. It imports
+circuitpython/physics.py, the same collision/physics engine the device
+game uses, so what you build and playtest here matches what runs on the
+board. The device game maintains its own code separately and just
+imports whatever LEVELS_DATA you save here.
 
 MODE
   Tab             -- toggle between Edit and Play
@@ -43,21 +43,30 @@ fresh attempt (R, entering Play, or switching levels) but not just
 from rolling off the screen.
 """
 
-import math
 import os
 import sys
 import subprocess
+import math
 import pygame
 
-# Resolve circuitpython/levels_data.py relative to this script's own
-# location (tools/level_editor.py -> ../circuitpython/levels_data.py),
-# so it works whether you run this from the repo root or from tools/.
+# Resolve circuitpython/ relative to this script's own location (tools/
+# level_editor.py -> ../circuitpython), both to import the shared physics
+# module from there and to locate levels_data.py below.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CIRCUITPYTHON_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "circuitpython"))
+sys.path.insert(0, CIRCUITPYTHON_DIR)
+
+from physics import (  # noqa: E402 -- must follow the sys.path insert above
+    WIDTH, HEIGHT, BALL_RADIUS, HOLE_RADIUS,
+    static_color, ramp_code, bar_segments,
+    idx, set_cell, clear_cell, clear_level, ramp_steepness_for_width,
+    apply_cells, circle_outline_pixels, ball_pixels_at, bar_pixels_for_draw,
+    update_bar_segments, step_ball, update_ball_roll, ball_accent_pixels_at,
+)
+
 # This is still where Save (S) writes to -- only Load (L) now prompts
 # with a file picker instead of assuming this path.
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LEVELS_PATH = os.path.normpath(
-    os.path.join(SCRIPT_DIR, "..", "circuitpython", "levels_data.py")
-)
+DEFAULT_LEVELS_PATH = os.path.join(CIRCUITPYTHON_DIR, "levels_data.py")
 
 
 def pick_load_file():
@@ -101,9 +110,6 @@ def pick_load_file():
         return ""
 
 
-
-WIDTH = 64
-HEIGHT = 32
 SCALE = 12
 
 COLORS = {
@@ -115,52 +121,13 @@ COLORS = {
     5: (255, 255, 0),   # hole worth 1 point
     6: (255, 140, 0),   # hole worth 2 points
     7: (255, 0, 255),   # hole worth 3 points
+    8: (255, 255, 255),  # ball roll accent -- a bright star/sparkle against the red ball
 }
-
-BALL_RADIUS = 2
-HOLE_RADIUS = BALL_RADIUS + 1  # slightly larger than the ball
-
-# ---------- Level geometry (the level currently being edited/played) ----------
-solid = bytearray(WIDTH * HEIGHT)
-ramp_code = bytearray(WIDTH * HEIGHT)  # 0 none, 1 "\", 2 "/"
-static_color = bytearray(WIDTH * HEIGHT)
-
-
-def idx(x, y):
-    return y * WIDTH + x
+BALL_ROLL_ACCENT_COLOR = 8
 
 
 def in_bounds(x, y):
     return 0 <= x < WIDTH and 0 <= y < HEIGHT
-
-
-def set_cell(x, y, wall=False, ramp_dir=0, goal=False):
-    i = idx(x, y)
-    if wall or ramp_dir != 0:
-        solid[i] = 1
-        static_color[i] = 2
-        if ramp_dir > 0:
-            ramp_code[i] = 1
-        elif ramp_dir < 0:
-            ramp_code[i] = 2
-    elif goal:
-        solid[i] = 0
-        ramp_code[i] = 0
-        static_color[i] = 3
-
-
-def clear_cell(x, y):
-    i = idx(x, y)
-    solid[i] = 0
-    ramp_code[i] = 0
-    static_color[i] = 0
-
-
-def clear_level():
-    global solid, ramp_code, static_color
-    solid = bytearray(WIDTH * HEIGHT)
-    ramp_code = bytearray(WIDTH * HEIGHT)
-    static_color = bytearray(WIDTH * HEIGHT)
 
 
 def add_border():
@@ -171,24 +138,47 @@ def add_border():
         set_cell(0, y, wall=True)
 
 
-def add_ramp(x_start, x_end, y_start, y_end, thickness=3):
+def add_ramp(x_start, x_end, y_start, y_end, thickness=1):
     if x_start > x_end:
         x_start, x_end = x_end, x_start
         y_start, y_end = y_end, y_start
     direction = 1 if y_end > y_start else (-1 if y_end < y_start else 0)
-    if x_start == x_end:
-        for dy in range(thickness):
-            y = y_start + dy
+    dx = x_end - x_start
+    dy = y_end - y_start
+    if dx == 0:
+        for dyi in range(thickness):
+            y = y_start + dyi
             if 0 <= y < HEIGHT:
-                set_cell(x_start, y, ramp_dir=direction or 1)
+                set_cell(x_start, y, ramp_dir=direction or 1, steepness=1.0)
         return
-    for x in range(x_start, x_end + 1):
-        t = (x - x_start) / (x_end - x_start)
-        ramp_y = int(y_start + t * (y_end - y_start))
-        for dy in range(thickness):
-            y = ramp_y + dy
-            if 0 <= y < HEIGHT:
-                set_cell(x, y, ramp_dir=direction)
+
+    width = abs(dx) / max(1, abs(dy))
+    steepness = ramp_steepness_for_width(width)
+
+    if abs(dy) <= abs(dx):
+        # Shallow-ish: step along x, painting a vertical thickness-band per
+        # column -- consecutive columns' bands always overlap here since
+        # the y-step per column is at most 1.
+        for x in range(x_start, x_end + 1):
+            t = (x - x_start) / dx
+            ramp_y = int(round(y_start + t * dy))
+            for dyi in range(thickness):
+                y = ramp_y + dyi
+                if 0 <= y < HEIGHT:
+                    set_cell(x, y, ramp_dir=direction, steepness=steepness)
+    else:
+        # Steep: stepping along x would skip rows faster than `thickness`
+        # can bridge, leaving gaps -- step along y instead (like a proper
+        # line-drawing algorithm choosing the larger-delta axis) so
+        # consecutive rows' horizontal bands always overlap instead.
+        y0, y1 = (y_start, y_end) if y_end >= y_start else (y_end, y_start)
+        for y in range(y0, y1 + 1):
+            t = (y - y_start) / dy
+            ramp_x = int(round(x_start + t * dx))
+            for dxi in range(thickness):
+                x = ramp_x + dxi
+                if 0 <= x < WIDTH:
+                    set_cell(x, y, ramp_dir=direction, steepness=steepness)
 
 
 def add_lanes_and_goal(lane_x_start):
@@ -209,26 +199,6 @@ def make_spinner(px, py, half_len=8, speed=0.04):
 
 def make_hole(px, py, value=1):
     return {"x": float(px), "y": float(py), "value": value}
-
-
-def circle_outline_pixels(cx, cy, r):
-    """A ring of pixels roughly r away from (cx, cy). Uses a direct
-    distance test rather than a midpoint/Bresenham circle -- at these
-    small radii that reads as noticeably rounder (Bresenham circles
-    tend to look octagonal/diamond-ish at radius ~3)."""
-    pts = set()
-    cx_i, cy_i = int(round(cx)), int(round(cy))
-    r_inner = r - 0.5
-    r_outer = r + 0.5
-    span = r + 1
-    for dx in range(-span, span + 1):
-        for dy in range(-span, span + 1):
-            d = math.hypot(dx, dy)
-            if r_inner <= d <= r_outer:
-                px, py = cx_i + dx, cy_i + dy
-                if 0 <= px < WIDTH and 0 <= py < HEIGHT:
-                    pts.add((px, py))
-    return pts
 
 
 # ---------- The 3 built-in templates (used as starting points) ----------
@@ -302,65 +272,6 @@ def build_level_3():
     return 3.0, 16.0, [make_spinner(21, 11, 8, 0.04)], []
 
 
-# ---------- Ball ----------
-BALL_OFFSETS = []
-for dy in range(-BALL_RADIUS, BALL_RADIUS + 1):
-    for dx in range(-BALL_RADIUS, BALL_RADIUS + 1):
-        if dx * dx + dy * dy <= BALL_RADIUS * BALL_RADIUS + 1:
-            BALL_OFFSETS.append((dx, dy))
-
-
-def point_segment_distance(px, py, x0, y0, x1, y1):
-    dx = x1 - x0
-    dy = y1 - y0
-    length_sq = dx * dx + dy * dy
-    if length_sq == 0:
-        t = 0.0
-    else:
-        t = ((px - x0) * dx + (py - y0) * dy) / length_sq
-        t = max(0.0, min(1.0, t))
-    closest_x = x0 + t * dx
-    closest_y = y0 + t * dy
-    ddx = px - closest_x
-    ddy = py - closest_y
-    return math.sqrt(ddx * ddx + ddy * ddy)
-
-
-BAR_HALF_THICKNESS = 1.0
-bar_segments = []
-
-
-def circle_blocked(cx, cy):
-    best_d = None
-    for seg in bar_segments:
-        d = point_segment_distance(cx, cy, *seg)
-        if best_d is None or d < best_d:
-            best_d = d
-    if best_d is not None and best_d < BALL_RADIUS + BAR_HALF_THICKNESS:
-        return True, "bar"
-    px = int(cx)
-    py = int(cy)
-    for dx, dy in BALL_OFFSETS:
-        x = px + dx
-        y = py + dy
-        if x < 0 or x >= WIDTH or y < 0 or y >= HEIGHT:
-            continue  # open past any edge -- a level only blocks here if it painted a wall
-        if solid[idx(x, y)]:
-            code = ramp_code[idx(x, y)]
-            direction = 1 if code == 1 else (-1 if code == 2 else 0)
-            return True, direction
-    return False, 0
-
-
-# ---------- Physics (same constants as the real board) ----------
-ACCEL_SCALE = 0.4
-FRICTION = 0.97
-RAMP_REDIRECT = 0.9
-RAMP_SLOWDOWN = 0.4
-WALL_DAMPING = -0.3
-BAR_RESTITUTION = 0.8  # bounciness of the flipper bounce (1.0 = perfectly elastic)
-MAX_SPEED = 1.5
-
 # ---------- pygame setup ----------
 pygame.init()
 screen = pygame.display.set_mode((WIDTH * SCALE, HEIGHT * SCALE + 40))
@@ -388,6 +299,8 @@ hole_value_selector = 1
 score = 0
 
 ball_x = ball_y = vel_x = vel_y = 0.0
+ball_rotation = 0.0
+ball_roll_direction = (1.0, 0.0)
 won = False
 win_timer = 0.0
 status_message = ""
@@ -430,16 +343,7 @@ def snapshot_current_level():
 def apply_level_snapshot(data):
     global current_start_x, current_start_y, spinners, holes, ball_start_set
     clear_level()
-    for (x0, x1, y, kind) in data["cells"]:
-        for x in range(x0, x1 + 1):
-            if kind == 1:
-                set_cell(x, y, wall=True)
-            elif kind == 2:
-                set_cell(x, y, ramp_dir=1)
-            elif kind == 3:
-                set_cell(x, y, ramp_dir=-1)
-            elif kind == 4:
-                set_cell(x, y, goal=True)
+    apply_cells(data["cells"])
     current_start_x, current_start_y = data["start"]
     ball_start_set = True
     spinners = [make_spinner(s["pivot_x"], s["pivot_y"], s.get("half_len", 8), s.get("speed", 0.04)) for s in data["spinners"]]
@@ -557,69 +461,39 @@ def nearest_removable(px, py):
 
 
 def restart_ball():
-    global ball_x, ball_y, vel_x, vel_y
+    global ball_x, ball_y, vel_x, vel_y, ball_rotation, ball_roll_direction
     ball_x, ball_y = current_start_x, current_start_y
     vel_x, vel_y = 0.0, 0.0
-
-
-def update_bar_segments():
-    bar_segments.clear()
-    for sp in spinners:
-        a = sp["angle"]
-        hl = sp["half_len"]
-        x0 = sp["pivot_x"] - hl * math.cos(a)
-        y0 = sp["pivot_y"] - hl * math.sin(a)
-        x1 = sp["pivot_x"] + hl * math.cos(a)
-        y1 = sp["pivot_y"] + hl * math.sin(a)
-        bar_segments.append((x0, y0, x1, y1))
-
-
-def ball_pixels_at(cx, cy):
-    px = int(cx)
-    py = int(cy)
-    pts = []
-    for dx, dy in BALL_OFFSETS:
-        x = px + dx
-        y = py + dy
-        if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-            pts.append((x, y))
-    return pts
-
-
-def bresenham_line(x0, y0, x1, y1):
-    points = []
-    dx = abs(x1 - x0)
-    dy = -abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx + dy
-    x, y = x0, y0
-    while True:
-        points.append((x, y))
-        if x == x1 and y == y1:
-            break
-        e2 = 2 * err
-        if e2 >= dy:
-            err += dy
-            x += sx
-        if e2 <= dx:
-            err += dx
-            y += sy
-    return points
-
-
-def bar_pixels_for_draw(seg):
-    x0, y0, x1, y1 = seg
-    pts = set()
-    for x, y in bresenham_line(int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))):
-        if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-            pts.add((x, y))
-    return pts
+    ball_rotation = 0.0
+    ball_roll_direction = (1.0, 0.0)
 
 
 def draw_pixel_cells(pixels, color):
     for x, y in pixels:
         pygame.draw.rect(screen, color, (x * SCALE, y * SCALE, SCALE - 1, SCALE - 1))
+
+
+GRID_COLOR = (45, 45, 52)
+HOVER_COLOR = (255, 255, 255)
+
+
+def draw_grid():
+    for x in range(WIDTH + 1):
+        px = x * SCALE
+        pygame.draw.line(screen, GRID_COLOR, (px, 0), (px, HEIGHT * SCALE))
+    for y in range(HEIGHT + 1):
+        py = y * SCALE
+        pygame.draw.line(screen, GRID_COLOR, (0, py), (WIDTH * SCALE, py))
+
+
+def draw_hover_highlight():
+    pos = pygame.mouse.get_pos()
+    if pos[1] >= HEIGHT * SCALE:
+        return
+    x, y = cell_from_mouse(pos)
+    if not in_bounds(x, y):
+        return
+    pygame.draw.rect(screen, HOVER_COLOR, (x * SCALE, y * SCALE, SCALE, SCALE), 1)
 
 
 def draw_board():
@@ -662,7 +536,7 @@ def draw_hud():
 def countdown():
     for text in ("3", "2", "1", "GO!"):
         pump_events()
-        update_bar_segments()
+        update_bar_segments(spinners)
         draw_board()
         draw_hud()
         label_surf = font.render(text, True, (255, 255, 255))
@@ -773,7 +647,7 @@ def pump_events():
                     if ramp_click_start is None:
                         ramp_click_start = pos
                     else:
-                        add_ramp(ramp_click_start[0], pos[0], ramp_click_start[1], pos[1], 3)
+                        add_ramp(ramp_click_start[0], pos[0], ramp_click_start[1], pos[1])
                         ramp_click_start = None
                 elif tool == 4:
                     current_start_x, current_start_y = float(pos[0]), float(pos[1])
@@ -820,8 +694,9 @@ while True:
 
     if mode == "edit":
         handle_edit_painting()
-        update_bar_segments()
+        update_bar_segments(spinners)
         draw_board()
+        draw_grid()
         if ball_start_set:
             draw_pixel_cells(ball_pixels_at(current_start_x, current_start_y), COLORS[1])
         if tool == 2 and ramp_click_start:
@@ -830,6 +705,7 @@ while True:
                 (ramp_click_start[0] * SCALE + SCALE // 2, ramp_click_start[1] * SCALE + SCALE // 2),
                 4,
             )
+        draw_hover_highlight()
         draw_hud()
         pygame.display.flip()
         clock.tick(50)
@@ -848,35 +724,7 @@ while True:
 
     for sp in spinners:
         sp["angle"] += sp["speed"]
-    update_bar_segments()
-
-    for seg in bar_segments:
-        d = point_segment_distance(ball_x, ball_y, *seg)
-        contact_dist = BALL_RADIUS + BAR_HALF_THICKNESS
-        if d < contact_dist:
-            x0, y0, x1, y1 = seg
-            dxs, dys = x1 - x0, y1 - y0
-            length_sq = dxs * dxs + dys * dys
-            t = 0.0 if length_sq == 0 else max(0.0, min(1.0, ((ball_x - x0) * dxs + (ball_y - y0) * dys) / length_sq))
-            closest_x, closest_y = x0 + t * dxs, y0 + t * dys
-            if d > 0.0001:
-                nx = (ball_x - closest_x) / d
-                ny = (ball_y - closest_y) / d
-            else:
-                seg_len = math.sqrt(length_sq) if length_sq > 0 else 1.0
-                nx, ny = -dys / seg_len, dxs / seg_len
-            # Reflect velocity across the contact normal (only if actually
-            # moving into the bar) -- this is what makes the bounce
-            # direction depend on the bar's current angle, not just which
-            # axis got blocked.
-            dot = vel_x * nx + vel_y * ny
-            if dot < 0:
-                vel_x -= (1 + BAR_RESTITUTION) * dot * nx
-                vel_y -= (1 + BAR_RESTITUTION) * dot * ny
-            overlap = contact_dist - d
-            if overlap > 0:
-                ball_x += nx * overlap
-                ball_y += ny * overlap
+    update_bar_segments(spinners)
 
     keys = pygame.key.get_pressed()
     tilt = 0.0
@@ -895,41 +743,11 @@ while True:
             SENSITIVITY_CURVE = 2.0
             tilt = math.copysign(abs(raw_tilt) ** SENSITIVITY_CURVE, raw_tilt)
 
-    vel_x += tilt * ACCEL_SCALE
-    vel_x *= FRICTION
-    vel_y *= FRICTION
-    vel_x = max(-MAX_SPEED, min(MAX_SPEED, vel_x))
-    vel_y = max(-MAX_SPEED, min(MAX_SPEED, vel_y))
-
-    ramp_hit_this_frame = False
-
-    new_x = ball_x + vel_x
-    blocked, ramp_dir = circle_blocked(new_x, ball_y)
-    if blocked:
-        if ramp_dir == "bar":
-            pass  # already reflected above -- just don't move into it
-        elif ramp_dir != 0 and not ramp_hit_this_frame:
-            vel_y += RAMP_REDIRECT * ramp_dir * vel_x
-            vel_x *= RAMP_SLOWDOWN
-            ramp_hit_this_frame = True
-        else:
-            vel_x *= WALL_DAMPING
-    else:
-        ball_x = new_x
-
-    new_y = ball_y + vel_y
-    blocked, ramp_dir = circle_blocked(ball_x, new_y)
-    if blocked:
-        if ramp_dir == "bar":
-            pass  # already reflected above -- just don't move into it
-        elif ramp_dir != 0 and not ramp_hit_this_frame:
-            vel_x += RAMP_REDIRECT * ramp_dir * vel_y
-            vel_y *= RAMP_SLOWDOWN
-            ramp_hit_this_frame = True
-        else:
-            vel_y *= WALL_DAMPING
-    else:
-        ball_y = new_y
+    prev_ball_x, prev_ball_y = ball_x, ball_y
+    ball_x, ball_y, vel_x, vel_y = step_ball(ball_x, ball_y, vel_x, vel_y, tilt)
+    ball_roll_direction, ball_rotation = update_ball_roll(
+        ball_roll_direction, ball_rotation, prev_ball_x, prev_ball_y, ball_x, ball_y
+    )
 
     gx, gy = int(ball_x), int(ball_y)
     hole_hit = None
@@ -956,6 +774,9 @@ while True:
 
     draw_board()
     draw_pixel_cells(ball_pixels_at(ball_x, ball_y), COLORS[1])
+    accent_pixels = ball_accent_pixels_at(ball_x, ball_y, ball_roll_direction, ball_rotation)
+    if accent_pixels:
+        draw_pixel_cells(accent_pixels, COLORS[BALL_ROLL_ACCENT_COLOR])
     center_px = (WIDTH * SCALE) // 2
     pygame.draw.line(screen, (60, 60, 70), (center_px, 0), (center_px, HEIGHT * SCALE), 1)
     marker_x = int(center_px + tilt * center_px)
