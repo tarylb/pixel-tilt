@@ -330,14 +330,18 @@ def load_level(index):
 
 
 def mark_level_won():
-    """Called the instant a level is won: records a new best time if this
-    run beat it (or is the first time it's been finished at all), and
-    shows a "NEW BEST" overlay with the time when it did. Returns how
-    long, in seconds, to pause on the win screen before advancing."""
+    """Called the instant a level is won: records a best time and shows a
+    "NEW BEST" overlay with the time, but only when an *existing* best
+    gets beaten -- a level's first-ever completion just records the time
+    silently, since there's nothing yet for it to have beaten. Returns
+    how long, in seconds, to pause on the win screen before advancing."""
     global win_label
     elapsed = time.monotonic() - level_start_time
     previous_best = best_times.get(current_level_index)
-    is_new_best = previous_best is None or elapsed < previous_best
+    if previous_best is None:
+        save_best_time(current_level_index, elapsed)
+        return 1.0
+    is_new_best = elapsed < previous_best
     if is_new_best:
         save_best_time(current_level_index, elapsed)
         win_label = label.Label(
