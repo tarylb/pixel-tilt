@@ -114,9 +114,13 @@ display.root_group = group
 
 
 def paint_static():
+    """Redraws the whole static layer (walls/ramps/goal/holes) from
+    scratch, blanking every other pixel first -- the bitmap is shared
+    with menus.py's screens (level select's boxes, calibration's bar),
+    which paint directly into it, so a level load has to reclaim the
+    entire display rather than only touching the cells it cares about."""
     for i in range(WIDTH * HEIGHT):
-        if static_color[i]:
-            bitmap[i % WIDTH, i // WIDTH] = static_color[i]
+        bitmap[i % WIDTH, i // WIDTH] = static_color[i]
 
 
 def apply_level_data(data):
