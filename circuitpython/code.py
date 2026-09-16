@@ -224,7 +224,11 @@ def load_progress():
 
 
 def save_progress(level_index):
-    """Returns True if the write actually succeeded -- see save_brightness()."""
+    """Returns True if the write actually succeeded -- see save_brightness().
+    No-ops (reporting success) in UNLOCKED_MODE, which never touches
+    real save data -- see UNLOCKED_MODE's own comment."""
+    if UNLOCKED_MODE:
+        return True
     try:
         with open(PROGRESS_PATH, "w") as f:
             f.write(str(level_index))
@@ -253,8 +257,13 @@ def load_best_times():
 
 def save_best_time(level_index, seconds):
     """Records a new best time for level_index and rewrites the whole
-    file -- see save_brightness() for the read-only-filesystem case."""
+    file -- see save_brightness() for the read-only-filesystem case.
+    Still updates the in-memory best_times in UNLOCKED_MODE (so any
+    "beat your best" feedback keeps working for the session) but never
+    writes it to disk -- see UNLOCKED_MODE's own comment."""
     best_times[level_index] = seconds
+    if UNLOCKED_MODE:
+        return True
     try:
         with open(BEST_TIMES_PATH, "w") as f:
             for index, value in best_times.items():
@@ -272,6 +281,15 @@ menus.init(
     display, group, bitmap, palette, pot, WIDTH, HEIGHT,
     ui_color, apply_brightness, save_brightness, save_calibration,
 )
+
+# Hold the right button on boot for a special session: every level
+# unlocked, nothing ever saved -- so it's safe to explore/practice any
+# level without touching normal mode's real progress or best times.
+# (The left button is boot.py's separate "keep CIRCUITPY writable from
+# my computer" gesture -- unrelated to this one.) Checked once, right
+# here at startup, rather than through poll_buttons()'s ongoing edge
+# detection.
+UNLOCKED_MODE = menus.right_held()
 
 
 current_level_index = 0
@@ -347,7 +365,7 @@ def mark_level_won():
     return 1.0
 
 
-furthest_level = load_progress()
+furthest_level = (len(LEVELS) - 1) if UNLOCKED_MODE else load_progress()
 furthest_level = max(0, min(furthest_level, len(LEVELS) - 1))
 best_times = load_best_times()
 

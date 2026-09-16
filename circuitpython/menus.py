@@ -88,6 +88,15 @@ _held_since = None  # when the current unbroken press (either/both) started
 _back_fired = False  # so back_edge fires once per hold, not every frame past 3s
 
 
+def right_held():
+    """True if the right button is physically held down right now -- a
+    direct, one-off read rather than going through poll_buttons()'s
+    edge-detection state machine, for code.py to check once at startup
+    (hold right on boot -> unlocked mode) before that state machine is
+    otherwise engaged."""
+    return not button_right.value
+
+
 def poll_buttons():
     """Return (left_edge, right_edge, select_edge, back_edge) -- each True
     only once per physical action. A lone press doesn't fire immediately:
