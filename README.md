@@ -1,11 +1,12 @@
-# pixel-tilt
+# Pixel Tilt
 
-A tilt-maze game for a 64x32 RGB LED matrix, controlled by tilting a potentiometer knob. Roll the ball to the green goal while dodging spinning bars and rolling off walls built into slopes.
+A tilt-maze game for a 64x32 RGB LED matrix, controlled by tilting the LED matrix panel. Roll the ball to the green goal while dodging spinning bars and rolling off walls and slopes.
 
 ## Hardware
 
-- Feather RP2040
-- Adafruit 64x32 RGB Matrix FeatherWing (6mm pitch)
+- [Adafruit Feather RP2040](https://www.adafruit.com/product/4884)
+- [Adafruit RGB Matrix Featherwing Kit - For RP2040, M0 and M4 Feathers](https://www.adafruit.com/product/3036)
+- 64x32 RGB LED Matrix Panel (HUB75)
 - Potentiometer: wiper on `A0`, outer legs on `3.3V` and `GND`
 - Two buttons, both wired to `GND` with internal pull-ups:
   - Left button on `SCK`
