@@ -1089,7 +1089,18 @@ while True:
         center_x = (WIDTH * SCALE) / 2
         half_width = (WIDTH * SCALE) / 2
         raw_tilt = max(-1.0, min(1.0, (mouse_x - center_x) / half_width))
-        if abs(raw_tilt) < 0.05:
+        # Wide on purpose -- this is the only way to release a GENTLE
+        # (non-keyboard, non-full-speed) tilt back to exactly level, and
+        # a narrow deadzone (previously 0.05, ~19px either side of
+        # center at this SCALE) makes that release nearly impossible to
+        # land precisely: any leftover fraction of a pixel off-center
+        # keeps tilt just barely nonzero, which keeps step_ball()'s
+        # tilt-spring actively fighting for that tiny target instead of
+        # ever reaching the FRICTION-only coast (see FRICTION's comment
+        # in physics.py) -- so gentler tilts never got to coast after
+        # releasing the way a keyboard tap-and-release (which snaps
+        # cleanly to exactly tilt=0) always could.
+        if abs(raw_tilt) < 0.15:
             tilt = 0.0
         else:
             SENSITIVITY_CURVE = 2.0

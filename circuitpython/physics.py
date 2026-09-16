@@ -28,14 +28,24 @@ HEIGHT = 32
 BALL_RADIUS = 2
 BAR_HALF_THICKNESS = 1.0
 
-MAX_SPEED = 1.5
+MAX_SPEED = 3
 # Each frame, vel_x closes this fraction of the gap to tilt*MAX_SPEED (its
 # "target" speed for the current tilt) -- so a steady tilt settles at a
 # speed proportional to how far it's tilted (like gravity along an incline)
 # instead of most of the tilt range saturating to MAX_SPEED almost
 # immediately. Higher = snappier/twitchier, lower = smoother/more gradual.
-TILT_RESPONSE = 0.15
-FRICTION = 0.97
+TILT_RESPONSE = 0.2
+# Fraction of speed lost per frame once nothing is actively driving it --
+# vel *= (1 - FRICTION), so 0 = no friction (coasts forever) and 1 =
+# instant stop. Bigger number = more friction, like the name suggests.
+# Only applies to vel_x while level (tilt == 0) -- while actively tilted,
+# TILT_RESPONSE's spring governs vel_x instead (see step_ball()); vel_y
+# has no tilt input at all, so it's always subject to FRICTION.
+FRICTION = 0.05
+# Below this speed, vel_x counts as "at rest" for deciding whether an
+# opposing tilt is braking or accelerating -- see step_ball()'s "cradle"
+# handling. Small enough to be imperceptible once treated as reached.
+BRAKE_THRESHOLD = 0.05
 WALL_DAMPING = -0.1
 # The ball reflects off whatever local surface direction the nearby solid
 # cells actually form (see _corner_normal()) rather than independently
@@ -520,8 +530,42 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
     their own win/out-of-bounds checks and rendering using the result."""
     ball_x, ball_y, vel_x, vel_y = resolve_bar_bounce(ball_x, ball_y, vel_x, vel_y)
 
-    vel_x += (tilt * MAX_SPEED - vel_x) * TILT_RESPONSE
-    vel_y *= FRICTION
+    if tilt != 0:
+        target_vel_x = tilt * MAX_SPEED
+        # Tilting the SAME way the ball is already (meaningfully) moving,
+        # or from a near-standstill, springs vel_x toward the target as
+        # usual -- tilt commands a target speed (proportional to how far
+        # it's tilted, like gravity along an incline -- see
+        # TILT_RESPONSE's comment). But tilting AGAINST existing motion
+        # (trying to stop or reverse it) used to spring straight toward
+        # the full opposite target just as fast, which blew through zero
+        # in about 3 frames at full speed/full opposite tilt -- reading
+        # as "the ball instantly starts rolling the other way" instead of
+        # ever actually catching it. Braking toward 0 specifically (not
+        # the opposite target) while still meaningfully moving gives a
+        # real, gradual "cradle" window: release tilt during it and the
+        # ball just continues slowing to a stop like normal, instead of
+        # rocketing past zero into reverse. Once speed decays under
+        # BRAKE_THRESHOLD it counts as "at rest", and the normal spring
+        # above takes over, accelerating into the new direction from a
+        # standing start -- same as if that tilt had been applied fresh.
+        opposing = (
+            (vel_x > BRAKE_THRESHOLD and target_vel_x < 0)
+            or (vel_x < -BRAKE_THRESHOLD and target_vel_x > 0)
+        )
+        if opposing:
+            vel_x += (0 - vel_x) * TILT_RESPONSE
+        else:
+            vel_x += (target_vel_x - vel_x) * TILT_RESPONSE
+    else:
+        # Level: nothing is commanding a target speed anymore, so instead
+        # of springing straight to 0 (which used to happen even with
+        # FRICTION maxed out, since the spring above doesn't care what
+        # FRICTION is set to -- tilt=0 just makes ITS OWN target 0 and
+        # brakes for it), the ball coasts on its existing momentum and
+        # only slows via FRICTION, same as vel_y always has.
+        vel_x *= (1 - FRICTION)
+    vel_y *= (1 - FRICTION)
     vel_x = max(-MAX_SPEED, min(MAX_SPEED, vel_x))
     vel_y = max(-MAX_SPEED, min(MAX_SPEED, vel_y))
 

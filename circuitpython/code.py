@@ -162,7 +162,7 @@ def draw_sprite(pixels, color_index, prev_pixels):
 
 pot = analogio.AnalogIn(board.A0)
 
-POT_DEADZONE = 1000
+POT_DEADZONE = 500
 CALIBRATION_PATH = "/calibration.txt"
 DEFAULT_POT_LEVEL = 33000
 DEFAULT_POT_LEFT = 27400
