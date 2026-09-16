@@ -8,8 +8,13 @@ historically the two were hand-copied and drifted out of sync repeatedly.
 
 Pure logic only: no displayio, no pygame, no hardware. Callers own their
 own rendering and input (potentiometer vs mouse/keyboard) and just read
-the shared grid state (`solid`, `ramp_code`, `ramp_slope`, `static_color`)
-to decide what to draw.
+the shared grid state (`solid`, `static_color`) to decide what to draw.
+
+There's no separate "ramp" cell type -- a wall is a wall. A diagonal or
+staircase-shaped run of wall cells naturally acts like a slope because
+step_ball() derives how much to roll (vs. bounce) a contact from how
+diagonal the local wall surface actually is at collision time, not from
+anything stored per cell.
 
 Import names directly (`from physics import solid, set_cell, ...`) --
 the grid arrays are mutated in place (never reassigned), so a plain
@@ -21,7 +26,6 @@ import math
 WIDTH = 64
 HEIGHT = 32
 BALL_RADIUS = 2
-HOLE_RADIUS = BALL_RADIUS + 1
 BAR_HALF_THICKNESS = 1.0
 
 MAX_SPEED = 1.5
@@ -32,36 +36,31 @@ MAX_SPEED = 1.5
 # immediately. Higher = snappier/twitchier, lower = smoother/more gradual.
 TILT_RESPONSE = 0.15
 FRICTION = 0.97
-# RAMP_REDIRECT is the fraction of horizontal speed converted to vertical
-# speed (or vice versa) on a steep (~45 degree) ramp -- scaled down for
-# shallower ramps (see ramp_steepness_for_width). RAMP_SLOWDOWN stays flat
-# regardless of steepness -- it's what brakes vel_x fast enough, every
-# single frame the ball stays pressed against a ramp, to keep the redirect
-# (which fires every one of those frames, not just once per contact) from
-# compounding into far more speed than intended.
-RAMP_REDIRECT = 0.5
-RAMP_SLOWDOWN = 0.4
-WALL_DAMPING = -0.3
-# Used instead of WALL_DAMPING specifically when the ball is blocked on
-# BOTH axes in the same frame (a corner/tip, not a flat wall face) -- see
-# _corner_normal(). Chosen to give the same bounce-back magnitude as
-# WALL_DAMPING for a square-on hit, but as a proper reflection off the
-# corner's actual direction instead of independently negating each axis,
-# which is what let the ball get stuck reversing in place at a corner
-# instead of deflecting off to the side.
-WALL_RESTITUTION = 0.3
+WALL_DAMPING = -0.1
+# The ball reflects off whatever local surface direction the nearby solid
+# cells actually form (see _corner_normal()) rather than independently
+# negating whichever axis got blocked, which is what let it get stuck
+# reversing in place at a corner instead of deflecting off to the side.
+# There's no separate "ramp" concept -- a diagonal/staircase run of plain
+# wall cells IS a slope: WALL_RESTITUTION is scaled down by how diagonal
+# that local surface normal is (see the diagonal_factor comment in
+# step_ball), from a square-on flat-wall bounce at one extreme to a
+# frictionless roll/slide at the other, with nothing extra to configure
+# per cell. A steep, close-to-45-degree staircase reads as touching a
+# corner almost every frame and rolls smoothly; a shallow one spends most
+# of its time resting on a flat tread between corners and reads more like
+# an actual bumpy staircase -- which is the honest result of this being
+# unit-cell pixel geometry, not a hand-tuned slope value.
+WALL_RESTITUTION = 0.9
 BAR_RESTITUTION = 0.8  # bounciness of the flipper bounce (1.0 = perfectly elastic)
 # Fraction of an into-the-bar impact that gets redirected along the bar's
-# length instead of just bounced straight back -- like a ramp, but using
-# the bar's current (rotating) angle instead of a fixed slope, so hitting
-# a tilted flipper sends the ball rolling/sliding off along it rather than
-# only ever bouncing off its normal.
+# length instead of just bounced straight back, using the bar's current
+# (rotating) angle, so hitting a tilted flipper sends the ball rolling/
+# sliding off along it rather than only ever bouncing off its normal.
 BAR_ROLL = 0.4
 
 # ---------- Level grid state (one level's worth of geometry) ----------
 solid = bytearray(WIDTH * HEIGHT)
-ramp_code = bytearray(WIDTH * HEIGHT)  # 0 none, 1 "\", 2 "/"
-ramp_slope = bytearray(WIDTH * HEIGHT)  # 0..255, how strongly a ramp cell redirects
 static_color = bytearray(WIDTH * HEIGHT)
 bar_segments = []  # current spinner bars as (x0, y0, x1, y1) tuples
 
@@ -70,90 +69,112 @@ def idx(x, y):
     return y * WIDTH + x
 
 
-def set_cell(x, y, wall=False, ramp_dir=0, goal=False, steepness=1.0):
+def set_cell(x, y, wall=False, goal=False):
     i = idx(x, y)
-    if wall or ramp_dir != 0:
+    if wall:
         solid[i] = 1
         static_color[i] = 2
-        if ramp_dir > 0:
-            ramp_code[i] = 1
-        elif ramp_dir < 0:
-            ramp_code[i] = 2
-        ramp_slope[i] = min(255, max(0, int(round(steepness * 255))))
     elif goal:
         solid[i] = 0
-        ramp_code[i] = 0
         static_color[i] = 3
 
 
 def clear_cell(x, y):
     i = idx(x, y)
     solid[i] = 0
-    ramp_code[i] = 0
-    ramp_slope[i] = 0
     static_color[i] = 0
 
 
 def clear_level():
     for i in range(WIDTH * HEIGHT):
         solid[i] = 0
-        ramp_code[i] = 0
-        ramp_slope[i] = 0
         static_color[i] = 0
 
 
-def ramp_steepness_for_width(width):
-    """A ramp row's span width (columns covered by that one row of rise) is
-    already an implicit slope: sin(angle) for a 1-row-rise/width-col-run
-    triangle, normalized against a 1-column-wide span (the steepest a
-    raster ramp row can be) so a ~45-degree ramp is full strength and
-    shallower ones redirect less."""
-    return min(1.0, math.sqrt(2) / math.sqrt(1 + width * width))
-
-
-def apply_cells(cells):
-    """Paint a level's wall/ramp/goal cells (levels_data's "cells" list,
-    entries of (x0, x1, y, kind)) into the grid. Caller is responsible for
-    clear_level() first and for anything else the level format carries
-    (holes, spinners, start position)."""
-    for x0, x1, y, kind in cells:
-        steepness = ramp_steepness_for_width(x1 - x0 + 1)
+def apply_walls(walls):
+    """Paint a level's wall cells (levels_data's "walls" list, entries of
+    (x0, x1, y)) into the grid. There's no separate ramp type -- a
+    diagonal run of wall cells (see add_wall_line() below) is just more
+    wall, and reduces to ordinary per-row spans same as any other wall
+    shape. Caller is responsible for clear_level() first and for
+    anything else the level format carries (goals, spinners, start
+    position)."""
+    for x0, x1, y in walls:
         for x in range(x0, x1 + 1):
-            if kind == 1:
-                set_cell(x, y, wall=True)
-            elif kind == 2:
-                set_cell(x, y, ramp_dir=1, steepness=steepness)
-            elif kind == 3:
-                set_cell(x, y, ramp_dir=-1, steepness=steepness)
-            elif kind == 4:
-                set_cell(x, y, goal=True)
+            set_cell(x, y, wall=True)
 
 
-def circle_outline_pixels(cx, cy, r):
-    """A ring of pixels roughly r away from (cx, cy). Uses a direct
-    distance test rather than a midpoint/Bresenham circle -- at these
-    small radii that reads as noticeably rounder (Bresenham circles tend
-    to look octagonal/diamond-ish at radius ~3)."""
-    pts = set()
-    cx_i, cy_i = int(round(cx)), int(round(cy))
-    r_inner = r - 0.5
-    r_outer = r + 0.5
-    span = r + 1
-    for dx in range(-span, span + 1):
-        for dy in range(-span, span + 1):
-            d = math.hypot(dx, dy)
-            if r_inner <= d <= r_outer:
-                px, py = cx_i + dx, cy_i + dy
-                if 0 <= px < WIDTH and 0 <= py < HEIGHT:
-                    pts.add((px, py))
-    return pts
+def apply_goals(goals):
+    """Paint a level's goal cells (levels_data's "goals" list, entries of
+    (x0, x1, y)) into the grid."""
+    for x0, x1, y in goals:
+        for x in range(x0, x1 + 1):
+            set_cell(x, y, goal=True)
+
+
+def wall_line_cells(x0, y0, x1, y1, thickness=1):
+    """The grid cells a straight line between two endpoints would cover,
+    thickness pixels wide, WITHOUT painting them -- the actual line math,
+    shared by add_wall_line() (which paints the result) and the level
+    editor's live preview of what a second click would place."""
+    if x0 > x1:
+        x0, x1 = x1, x0
+        y0, y1 = y1, y0
+    dx = x1 - x0
+    dy = y1 - y0
+    cells = []
+    if dx == 0:
+        for dyi in range(thickness):
+            y = y0 + dyi
+            if 0 <= y < HEIGHT:
+                cells.append((x0, y))
+        return cells
+
+    if abs(dy) <= abs(dx):
+        # Shallow-ish: step along x, banding a vertical thickness-band per
+        # column -- consecutive columns' bands always overlap here since
+        # the y-step per column is at most 1.
+        for x in range(x0, x1 + 1):
+            t = (x - x0) / dx
+            line_y = int(round(y0 + t * dy))
+            for dyi in range(thickness):
+                y = line_y + dyi
+                if 0 <= y < HEIGHT:
+                    cells.append((x, y))
+    else:
+        # Steep: stepping along x would skip rows faster than `thickness`
+        # can bridge, leaving gaps -- step along y instead (like a proper
+        # line-drawing algorithm choosing the larger-delta axis) so
+        # consecutive rows' horizontal bands always overlap instead.
+        ylo, yhi = (y0, y1) if y1 >= y0 else (y1, y0)
+        for y in range(ylo, yhi + 1):
+            t = (y - y0) / dy
+            line_x = int(round(x0 + t * dx))
+            for dxi in range(thickness):
+                x = line_x + dxi
+                if 0 <= x < WIDTH:
+                    cells.append((x, y))
+    return cells
+
+
+def add_wall_line(x0, y0, x1, y1, thickness=1):
+    """Rasterize a straight line of wall cells between two endpoints,
+    thickness pixels wide -- the level editor's click-two-points tool for
+    building a clean diagonal/staircase wall run without having to
+    freehand-drag every pixel. Purely a convenience for painting the
+    grid: the result is indistinguishable from any other wall cell (no
+    stored slope/direction) -- step_ball() derives "this is a slope"
+    from the shape of whatever solid cells happen to be there at
+    collision time, not from how they got painted."""
+    for x, y in wall_line_cells(x0, y0, x1, y1, thickness):
+        set_cell(x, y, wall=True)
 
 
 # The ball's actual collision/rendering reach, squared -- BALL_RADIUS+1
 # rather than BALL_RADIUS itself so the rounded shape below isn't a
 # perfect (smaller) diamond/square. _touching_cells() uses this exact
 # same threshold: collision and rendering must agree on how far the ball
-# reaches, or the ball's drawn edge can visibly sit on top of a wall/ramp
+# reaches, or the ball's drawn edge can visibly sit on top of a wall
 # cell before physics agrees it's touching anything (or vice versa).
 BALL_REACH_SQ = BALL_RADIUS * BALL_RADIUS + 1
 
@@ -322,8 +343,8 @@ def _touching_cells(cx, cy):
     nearest point on that cell back to (cx, cy). Uses the exact same
     reach as BALL_OFFSETS (the ball's rendered shape), not just
     BALL_RADIUS itself -- collision must match what's drawn, or the
-    ball's edge can visibly sit on top of a wall/ramp cell (or vice
-    versa) before physics agrees it's touching anything.
+    ball's edge can visibly sit on top of a wall cell (or vice versa)
+    before physics agrees it's touching anything.
 
     This is a real geometric circle-vs-square test, NOT the ball's
     discretized rendering shape (BALL_OFFSETS, used by ball_pixels_at for
@@ -331,7 +352,7 @@ def _touching_cells(cx, cy):
     used to be how collision detection worked here too, but BALL_OFFSETS
     deliberately excludes the (+-BALL_RADIUS, +-BALL_RADIUS) corners to
     look round -- which means it has real blind spots at exactly those
-    corners: a wall or ramp corner sitting in that gap went completely
+    corners: a wall corner sitting in that gap went completely
     undetected until the ball's sub-pixel position drifted enough to
     bring it into a checked cell, at which point it would suddenly catch.
     A true per-cell distance test has no such gap."""
@@ -355,32 +376,29 @@ def _touching_cells(cx, cy):
 
 
 def circle_blocked(cx, cy):
-    """Returns (blocked, direction, steepness). direction is "bar" for a
-    spinner, 0 for a plain wall, or +-1 for a ramp; steepness (0..1) scales
-    how strongly a ramp redirects velocity -- see ramp_steepness_for_width."""
+    """Returns (blocked, is_bar). is_bar is True when what's blocking is a
+    spinner bar rather than the solid grid -- resolve_bar_bounce() already
+    computed the correct reflection for that case, so step_ball() just
+    needs to know not to also run wall-corner reflection on top of it."""
     best_d = None
     for seg in bar_segments:
         d = point_segment_distance(cx, cy, seg[0], seg[1], seg[2], seg[3])
         if best_d is None or d < best_d:
             best_d = d
     if best_d is not None and best_d < BALL_RADIUS + BAR_HALF_THICKNESS:
-        return True, "bar", 0.0
-    for x, y, _ddx, _ddy, _dist in _touching_cells(cx, cy):
-        i = idx(x, y)
-        code = ramp_code[i]
-        direction = 1 if code == 1 else (-1 if code == 2 else 0)
-        steepness = ramp_slope[i] / 255.0 if code else 0.0
-        return True, direction, steepness
-    return False, 0, 0.0
+        return True, True
+    for _x, _y, _ddx, _ddy, _dist in _touching_cells(cx, cy):
+        return True, False
+    return False, False
 
 
 def _wall_blocked(cx, cy):
-    """Like circle_blocked, but only the solid-grid (wall/ramp) check --
-    no bar-proximity check. Used to keep the bar-bounce position
-    correction below from ever shoving the ball into a wall: the normal
-    per-frame collision code only checks whether the *next* step is
-    blocked, so once a push embeds the ball's center inside solid cells,
-    nothing would ever move it back out again."""
+    """Like circle_blocked, but only the solid-grid (wall) check -- no
+    bar-proximity check. Used to keep the bar-bounce position correction
+    below from ever shoving the ball into a wall: the normal per-frame
+    collision code only checks whether the *next* step is blocked, so
+    once a push embeds the ball's center inside solid cells, nothing
+    would ever move it back out again."""
     for _ in _touching_cells(cx, cy):
         return True
     return False
@@ -424,10 +442,10 @@ def resolve_bar_bounce(ball_x, ball_y, vel_x, vel_y):
                 vel_x -= (1 + BAR_RESTITUTION) * dot_n * nx
                 vel_y -= (1 + BAR_RESTITUTION) * dot_n * ny
                 # Also roll some of that impact along the bar's length,
-                # like a ramp -- continuing whichever way the ball was
-                # already drifting tangentially, so hitting a tilted
-                # flipper sends it sliding off along the slope instead of
-                # only ever bouncing straight back off it.
+                # continuing whichever way the ball was already drifting
+                # tangentially, so hitting a tilted flipper sends it
+                # sliding off along the slope instead of only ever
+                # bouncing straight back off it.
                 dot_t = vel_x * tx + vel_y * ty
                 roll_sign = 1.0 if dot_t >= 0 else -1.0
                 vel_x += BAR_ROLL * -dot_n * roll_sign * tx
@@ -447,24 +465,25 @@ def resolve_bar_bounce(ball_x, ball_y, vel_x, vel_y):
 
 
 def _corner_normal(cx, cy):
-    """Approximate the direction pointing away from nearby solid cells
-    (walls AND ramps), for resolving corner contacts -- e.g. the tip of a
-    wall span -- where the ball is blocked on both axes at once.
-    Axis-separated collision has no idea a corner is round: it just
-    negates whichever axis got blocked, which for a corner hit on both
-    axes means bouncing straight back the way the ball came instead of
-    deflecting to the side. This uses the same true circle-vs-cell test
-    as circle_blocked (_touching_cells) and averages the away-from-ball
-    directions of every touching cell into one usable normal. Ramp cells
-    count too: step_ball only calls this once BOTH axes ended up in its
-    generic "blocked" branch, which happens for a ramp cell too if the
-    other axis already used up this frame's one ramp redirect
-    (ramp_hit_this_frame) -- excluding ramp cells here would just
-    reintroduce a fallback gap for that case. Returns a (nx, ny) unit
-    vector, or None if nothing solid is touching (shouldn't normally
-    happen right after both axes were just found blocked using this same
-    test, but the position may have shifted slightly) or if the touching
-    cells' directions cancel out (the ball pinched between two opposing
+    """Approximate the direction pointing away from nearby solid cells,
+    for resolving contacts where axis-separated collision alone would
+    give the wrong answer -- a flat wall face reduces to a single clean
+    axis-aligned normal here (matching the old per-axis behavior exactly),
+    but a corner or a diagonal/staircase run of wall cells doesn't have
+    one obvious "which axis" to bounce off; independently negating
+    whichever axis got blocked would bounce a corner hit straight back
+    the way the ball came instead of deflecting it to the side (or, for
+    a diagonal run, would never let it roll along the slope at all).
+    This uses the same true circle-vs-cell test as circle_blocked
+    (_touching_cells) and averages the away-from-ball directions of
+    every touching cell into one usable normal -- how far that normal
+    leans off-axis is also what step_ball() uses to decide how much
+    "roll" (vs. plain bounce) a given contact gets; see the
+    diagonal_factor comment there. Returns a (nx, ny) unit vector, or
+    None if nothing solid is touching (shouldn't normally happen right
+    after both axes were just found blocked using this same test, but
+    the position may have shifted slightly) or if the touching cells'
+    directions cancel out (the ball pinched between two opposing
     surfaces, with no single well-defined escape direction)."""
     sum_x = 0.0
     sum_y = 0.0
@@ -480,9 +499,9 @@ def _corner_normal(cx, cy):
 
 def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
     """Advance the ball one physics tick: spinner-bar bounce, tilt-driven
-    acceleration, and wall/ramp collision with redirect. Returns the
-    updated (ball_x, ball_y, vel_x, vel_y) -- callers handle their own
-    win/hole/out-of-bounds checks and rendering using the result."""
+    acceleration, and wall collision with a geometry-derived roll/bounce.
+    Returns the updated (ball_x, ball_y, vel_x, vel_y) -- callers handle
+    their own win/out-of-bounds checks and rendering using the result."""
     ball_x, ball_y, vel_x, vel_y = resolve_bar_bounce(ball_x, ball_y, vel_x, vel_y)
 
     vel_x += (tilt * MAX_SPEED - vel_x) * TILT_RESPONSE
@@ -490,40 +509,22 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
     vel_x = max(-MAX_SPEED, min(MAX_SPEED, vel_x))
     vel_y = max(-MAX_SPEED, min(MAX_SPEED, vel_y))
 
-    ramp_hit_this_frame = False
-    # Set when an axis is blocked with no ramp redirect applied -- either
-    # a plain wall, or a ramp that lost out to the other axis's
-    # one-redirect-per-frame limit.
     x_stuck = False
     y_stuck = False
     incoming_vel_x, incoming_vel_y = vel_x, vel_y
 
     new_x = ball_x + vel_x
-    blocked, ramp_dir, steepness = circle_blocked(new_x, ball_y)
+    blocked, is_bar = circle_blocked(new_x, ball_y)
     if blocked:
-        if ramp_dir == "bar":
-            pass  # already reflected above -- just don't move into it
-        elif ramp_dir != 0 and not ramp_hit_this_frame:
-            vel_y += RAMP_REDIRECT * steepness * ramp_dir * vel_x
-            vel_y = max(-MAX_SPEED, min(MAX_SPEED, vel_y))
-            vel_x *= RAMP_SLOWDOWN
-            ramp_hit_this_frame = True
-        else:
+        if not is_bar:  # a bar's reflection was already applied above
             x_stuck = True
     else:
         ball_x = new_x
 
     new_y = ball_y + vel_y
-    blocked, ramp_dir, steepness = circle_blocked(ball_x, new_y)
+    blocked, is_bar = circle_blocked(ball_x, new_y)
     if blocked:
-        if ramp_dir == "bar":
-            pass  # already reflected above -- just don't move into it
-        elif ramp_dir != 0 and not ramp_hit_this_frame:
-            vel_x += RAMP_REDIRECT * steepness * ramp_dir * vel_y
-            vel_x = max(-MAX_SPEED, min(MAX_SPEED, vel_x))
-            vel_y *= RAMP_SLOWDOWN
-            ramp_hit_this_frame = True
-        else:
+        if not is_bar:
             y_stuck = True
     else:
         ball_y = new_y
@@ -531,7 +532,7 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
     if x_stuck or y_stuck:
         # Reflect off the ACTUAL nearby wall geometry rather than just
         # negating whichever axis got blocked. Requiring BOTH axes to be
-        # blocked before doing this (the previous approach) misses the
+        # blocked before doing this (an earlier approach) misses the
         # single most common case: a ball moving mostly along one axis
         # with the other axis's velocity near zero can never register as
         # "blocked" on that axis at all -- moving by ~0 from an already-
@@ -541,10 +542,6 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
         # spot forever, never gaining the sideways motion needed to clear
         # it (confirmed: a ball parked at a tip with tilt held stayed
         # completely motionless, vel_y pinned at exactly 0.0, indefinitely).
-        # For a genuinely flat wall this reduces to exactly the old
-        # per-axis behavior anyway, since the normal comes out purely
-        # axis-aligned there -- this only changes anything right at a
-        # corner or a diagonal graze, which is exactly where it needs to.
         #
         # Evaluate the geometry at the position the ball actually tried
         # to reach on each blocked axis (new_x/new_y), not its current,
@@ -559,8 +556,25 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
             nx, ny = normal
             dot = incoming_vel_x * nx + incoming_vel_y * ny
             if dot < 0:
-                vel_x = incoming_vel_x - (1 + WALL_RESTITUTION) * dot * nx
-                vel_y = incoming_vel_y - (1 + WALL_RESTITUTION) * dot * ny
+                # This one formula covers both a flat wall bounce and a
+                # rolling slope -- there's no separate ramp case. |nx*ny|
+                # is 0 whenever the normal is purely horizontal/vertical
+                # (a flat wall face) and peaks at 0.5 exactly at 45
+                # degrees (nx=ny=1/sqrt(2), a corner or a diagonal/
+                # staircase run of wall cells), so doubling it gives a
+                # clean 0..1 "how much of a slope is this contact"
+                # reading. At 0 the effective restitution is just
+                # WALL_RESTITUTION -- an ordinary bounce, unchanged from
+                # a flat wall. At 1 it's driven to exactly 0, which makes
+                # this reflection formula cancel the into-the-wall
+                # velocity component and keep the along-the-wall
+                # component untouched -- a frictionless slide along the
+                # surface, i.e. rolling, with no extra ramp-specific code
+                # needed to get there.
+                diagonal_factor = 2 * abs(nx * ny)
+                restitution = WALL_RESTITUTION * (1 - diagonal_factor)
+                vel_x = incoming_vel_x - (1 + restitution) * dot * nx
+                vel_y = incoming_vel_y - (1 + restitution) * dot * ny
             else:
                 vel_x, vel_y = incoming_vel_x, incoming_vel_y
         else:
@@ -574,5 +588,30 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
                 vel_x *= abs(WALL_DAMPING)
             if y_stuck:
                 vel_y *= abs(WALL_DAMPING)
+
+        # The corrected velocity above is worthless if position never
+        # actually advances to use it. When more than one nearby cell is
+        # within reach at once (a corner, or several staircase steps
+        # close together), escaping can require genuinely DIAGONAL
+        # movement -- bisecting vel_x and vel_y independently can each
+        # stay blocked by some other nearby cell even when the combined
+        # diagonal step would clear all of them at once (resting square
+        # on top of a cluster of cells is the clearest case: moving in x
+        # alone never gains any distance from cells directly below, and
+        # moving in y alone never gains any distance from cells off to
+        # the side). So move both axes together as one 2D step, backing
+        # off geometrically (not all-or-nothing) if the full corrected
+        # velocity is still blocked, so the ball creeps free of a tight
+        # multi-cell contact over a few frames instead of freezing
+        # completely until some single frame's full step happens to
+        # clear the whole cluster in one bound.
+        step_x, step_y = vel_x, vel_y
+        for _ in range(8):
+            if not circle_blocked(ball_x + step_x, ball_y + step_y)[0]:
+                ball_x += step_x
+                ball_y += step_y
+                break
+            step_x *= 0.5
+            step_y *= 0.5
 
     return ball_x, ball_y, vel_x, vel_y

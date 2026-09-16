@@ -1,6 +1,6 @@
 """
 Tilt-maze game. Flash this file (as code.py or main.py) together with
-levels_data.py, physics.py, and menus.py to CIRCUITPY.
+levels_data.json, physics.py, and menus.py to CIRCUITPY.
 
 Feather RP2040 + Adafruit 64x32 RGB Matrix FeatherWing (6mm pitch)
 Potentiometer wiper on A0, outer legs on 3.3V and GND.
@@ -11,20 +11,19 @@ Requires boot.py to give this code write access for saving progress.
 """
 
 import time
+import math
+import json
 import board
 import displayio
 import framebufferio
 import rgbmatrix
 import analogio
-import terminalio
-from adafruit_display_text import label
 
-from levels_data import LEVELS_DATA
 from physics import (
-    WIDTH, HEIGHT, BALL_RADIUS, HOLE_RADIUS,
+    WIDTH, HEIGHT, BALL_RADIUS,
     static_color, bar_segments,
-    idx, clear_level, apply_cells, circle_outline_pixels,
-    ball_pixels_at, point_segment_distance, bar_pixels_for_draw,
+    idx, clear_level, apply_walls, apply_goals,
+    ball_pixels_at, bar_pixels_for_draw,
     update_bar_segments, step_ball, update_ball_roll, ball_accent_pixels_at,
 )
 import menus
@@ -42,12 +41,15 @@ matrix = rgbmatrix.RGBMatrix(
 )
 display = framebufferio.FramebufferDisplay(matrix, auto_refresh=False)
 
-bitmap = displayio.Bitmap(WIDTH, HEIGHT, 9)
-palette = displayio.Palette(9)
+bitmap = displayio.Bitmap(WIDTH, HEIGHT, 7)
+palette = displayio.Palette(7)
 
 # Full-brightness reference colors -- apply_brightness() scales these into
 # `palette` and into any UI text color (via ui_color()) so the whole
-# display, not just game elements, dims consistently.
+# display, not just game elements, dims consistently. Index 5 (yellow) is
+# also what menus.py uses for the level-select underline -- it's not
+# just a game color, so keep it even though the game itself only uses
+# indices 0-4 and 6.
 BASE_PALETTE_COLORS = (
     0x000000,
     0xFF3300,
@@ -55,11 +57,9 @@ BASE_PALETTE_COLORS = (
     0x00FF00,
     0xAA00FF,
     0xFFFF00,
-    0xFF8C00,
-    0xFF00FF,
     0xFFFFFF,  # ball roll accent -- a bright star/sparkle against the red ball
 )
-BALL_ROLL_ACCENT_COLOR = 8
+BALL_ROLL_ACCENT_COLOR = 6
 
 BRIGHTNESS_PATH = "/brightness.txt"
 DEFAULT_BRIGHTNESS = 1.0
@@ -114,40 +114,38 @@ display.root_group = group
 
 
 def paint_static():
-    """Redraws the whole static layer (walls/ramps/goal/holes) from
-    scratch, blanking every other pixel first -- the bitmap is shared
-    with menus.py's screens (level select's boxes, calibration's bar),
-    which paint directly into it, so a level load has to reclaim the
-    entire display rather than only touching the cells it cares about."""
+    """Redraws the whole static layer (walls/goal) from scratch, blanking
+    every other pixel first -- the bitmap is shared with menus.py's
+    screens (level select's boxes, calibration's bar), which paint
+    directly into it, so a level load has to reclaim the entire display
+    rather than only touching the cells it cares about."""
     for i in range(WIDTH * HEIGHT):
         bitmap[i % WIDTH, i // WIDTH] = static_color[i]
 
 
 def apply_level_data(data):
     clear_level()
-    apply_cells(data["cells"])
-    holes = [
-        {"x": h["x"], "y": h["y"], "value": h["value"]}
-        for h in data.get("holes", [])
-    ]
-    for h in holes:
-        color = 4 + h["value"]
-        for px, py in circle_outline_pixels(h["x"], h["y"], HOLE_RADIUS):
-            static_color[idx(px, py)] = color
+    apply_walls(data["walls"])
+    apply_goals(data["goals"])
     paint_static()
     sx, sy = data["start"]
     spinners = [
         {
-            "pivot_x": s["pivot_x"],
-            "pivot_y": s["pivot_y"],
-            "half_len": s["half_len"],
-            "angle": 0.0,
-            "speed": s["speed"],
+            "pivot_x": px,
+            "pivot_y": py,
+            "half_len": half_len,
+            "angle": math.radians(start_angle_deg),
+            "speed": speed,
+            "direction": direction,
         }
-        for s in data["spinners"]
+        for px, py, half_len, speed, start_angle_deg, direction in data["spinners"]
     ]
-    return sx, sy, spinners, holes
+    return sx, sy, spinners
 
+
+LEVELS_DATA_PATH = "/levels_data.json"
+with open(LEVELS_DATA_PATH, "r") as f:
+    LEVELS_DATA = json.load(f)
 
 LEVELS = [lambda d=d: apply_level_data(d) for d in LEVELS_DATA]
 
@@ -280,11 +278,8 @@ current_level_index = 0
 current_start_x = 0.0
 current_start_y = 0.0
 spinners = []
-holes = []
-hole_labels = []
 ball_pixels = []
 bar_pixels_list = []
-score = 0
 ball_rotation = 0.0
 ball_roll_direction = (1.0, 0.0)
 level_start_time = 0.0
@@ -293,16 +288,15 @@ win_label = None
 
 def load_level(index):
     global current_level_index, current_start_x, current_start_y
-    global spinners, holes, ball_x, ball_y, vel_x, vel_y, ball_pixels, bar_pixels_list, score
+    global spinners, ball_x, ball_y, vel_x, vel_y, ball_pixels, bar_pixels_list
     global ball_rotation, ball_roll_direction, level_start_time, win_label
 
     current_level_index = index
-    current_start_x, current_start_y, spinners, holes = LEVELS[index]()
+    current_start_x, current_start_y, spinners = LEVELS[index]()
     ball_x, ball_y = current_start_x, current_start_y
     vel_x, vel_y = 0.0, 0.0
     ball_pixels = []
     bar_pixels_list = []
-    score = 0
     ball_rotation = 0.0
     ball_roll_direction = (1.0, 0.0)
     level_start_time = time.monotonic()
@@ -310,16 +304,6 @@ def load_level(index):
     if win_label is not None:
         group.remove(win_label)
         win_label = None
-
-    for lbl in hole_labels:
-        group.remove(lbl)
-    hole_labels.clear()
-    for h in holes:
-        lbl = label.Label(terminalio.FONT, text=str(h["value"]), color=ui_color(), scale=1)
-        lbl.anchor_point = (0.5, 0.5)
-        lbl.anchored_position = (int(h["x"]), int(h["y"]))
-        group.append(lbl)
-        hole_labels.append(lbl)
 
     update_bar_segments(spinners)
     for seg in bar_segments:
@@ -378,23 +362,12 @@ while True:
         BRIGHTNESS = menus.set_brightness_screen(BRIGHTNESS, MIN_BRIGHTNESS)
         continue
     if menu_choice == "reset_progress":
+        # confirm_reset_progress() does the save and shows the Reset!/Not
+        # saved result itself (reusing its own screen -- see its
+        # docstring); it only reports back whether to also zero our own
+        # in-memory furthest_level, which it has no reason to know about.
         if menus.confirm_reset_progress():
             furthest_level = 0
-            saved = save_progress(furthest_level)
-            msg_label = label.Label(
-                terminalio.FONT,
-                text="Reset!" if saved else "Not saved\n(read-only)",
-                color=ui_color(),
-                scale=1,
-            )
-            msg_label.anchor_point = (0.5, 0.5)
-            msg_label.anchored_position = (WIDTH // 2, HEIGHT // 2)
-            msg_label.line_spacing = 0.9
-            msg_group = displayio.Group()
-            msg_group.append(msg_label)
-            display.root_group = msg_group
-            display.refresh(minimum_frames_per_second=0)
-            time.sleep(1.0)
         continue
     if menu_choice == "select":
         start_index = menus.level_select(furthest_level, len(LEVELS), best_times, format_time)
