@@ -214,7 +214,15 @@ def update_ball_roll(direction, rotation, prev_x, prev_y, cx, cy):
       freezes its animation instead of losing its heading.
     - rotation: angle (radians) advanced by arc length / BALL_RADIUS --
       arc length = radius * angle for something rolling without
-      slipping. Wraps to stay within [0, 2*pi).
+      slipping. Deliberately left unwrapped (not modulo 2*pi): the
+      ball's checker pattern (ball_accent_pixels_at()) slides its grid
+      by rotation * BALL_RADIUS, i.e. the total arc length rolled --
+      wrapping rotation back to 0 partway through a level would make
+      that slide distance jump backwards discontinuously, which is
+      exactly the "checkers jump instead of moving smoothly" bug this
+      fixed. A float has more than enough precision for this to never
+      matter in practice (it's reset to 0 on every level load/restart
+      anyway, alongside ball_x/ball_y).
 
     Callers track both alongside ball_x/ball_y/vel_x/vel_y (it's display
     state, not something step_ball needs to know about)."""
@@ -223,53 +231,61 @@ def update_ball_roll(direction, rotation, prev_x, prev_y, cx, cy):
     distance = math.sqrt(dx * dx + dy * dy)
     if distance > 0.0001:
         direction = (dx / distance, dy / distance)
-    rotation = (rotation + distance / BALL_RADIUS) % (2 * math.pi)
+    rotation = rotation + distance / BALL_RADIUS
     return direction, rotation
 
 
-# A small plus-shaped mark riding the ball's surface, centered wherever
-# ball_accent_pixels_at currently places it. With only one mark active
-# at a time (not several at once), a 5-pixel plus is a reasonable
-# fraction of the ball's ~21 total pixels rather than overwhelming it.
-BALL_STAR_OFFSETS = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+# Cell size (in pixels) of the checker grid painted on the ball's
+# surface. A first attempt used 2px cells (crisp, clearly checkered,
+# lots of squares visible), sliding the grid's origin smoothly with
+# distance rolled -- but at that cell size, a 1px slide flips up to
+# ~11 of the ball's ~21 pixels at once, since the whole grid moves in
+# lockstep and there are enough 2px-spaced boundaries crossing the
+# ball's small silhouette for several to shift together. A rotating
+# angle-sector "pinwheel" (each pixel's own angle decides its wedge,
+# independent of the others) fixed the smoothness but no longer reads
+# as a checkerboard. 4px cells were smoother (~6 pixels/step) but
+# visibly coarser -- fewer, bigger squares. 3px lands closer to the
+# original look (more, smaller squares) while still cutting the worst-
+# case jump from 2px's ~11 down to ~8 (checked directly in headless
+# testing, not just assumed): the middle ground between "as checkered
+# as possible" and "as smooth as possible".
+BALL_CHECKER_SIZE = 3
 
 
 def ball_accent_pixels_at(cx, cy, direction, rotation):
-    """The list of (x, y) pixels -- a single mark, possibly empty -- to
-    draw in a contrasting "roll accent" color on top of the base ball
-    sprite, to fake the look of an actual rolling sphere viewed from
-    directly above:
+    """The (x, y) pixels to draw in a contrasting "roll accent" color on
+    top of the base ball sprite -- alternating squares of a checkerboard
+    painted on the ball. The grid itself is always axis-aligned (never
+    rotated): continuously rotating a checker pattern this small just
+    turns it into single-pixel noise once it's off-axis, since there
+    are only a couple of pixels per cell to begin with and a rotated
+    grid almost never lines back up with the pixel grid.
 
-    Picture a marked point starting at the TOP of the ball, rolling
-    without slipping about a horizontal axis perpendicular to its
-    direction of travel (like a real ball rolling on a table). This is
-    the classic "top of a rolling wheel moves the same way the wheel is
-    traveling" result: viewed from directly above, the point's position
-    projects onto a line through the ball along `direction`, sweeping
-    from the trailing edge to the leading edge (offset = BALL_RADIUS *
-    sin(rotation), which is 0 at rotation=0 and increases toward
-    +BALL_RADIUS, i.e. the leading edge, as rotation grows) while it's
-    on the near/"top" half of the roll (cos(rotation) >= 0); for the
-    other half (cos(rotation) < 0) it's rotated around to the underside
-    and hidden entirely, reappearing at the trailing edge once rotation
-    wraps back past 2*pi. That's what makes it read as sweeping across
-    in the same direction the ball is actually moving, then under, then
-    back on top -- and it falls out the same way for any direction, not
-    just horizontal/vertical."""
-    if math.cos(rotation) < 0:
-        return []
+    Instead, the grid's origin SLIDES along the direction of travel, by
+    rotation * BALL_RADIUS pixels -- which is exactly the arc length
+    rolled so far (arc length = radius * angle) -- so the pattern
+    creeps at the same rate the ball actually moves, like a tank tread.
+    This also makes the slide correctly reverse for the reverse
+    direction with no extra handling: shift_x/shift_y are scaled by
+    direction's own (signed) ux/uy components directly, so rolling left
+    (ux < 0) slides the grid the other way from rolling right on its
+    own, unlike a rotation-angle-based approach (see BALL_CHECKER_SIZE's
+    comment above) which needs rotation's sign corrected by hand since
+    rotation itself only tracks how far the ball has turned, not which
+    way."""
     ux, uy = direction
-    offset = BALL_RADIUS * math.sin(rotation)
-    mark_x = int(round(cx + ux * offset))
-    mark_y = int(round(cy + uy * offset))
+    slide = rotation * BALL_RADIUS
+    shift_x = math.floor(slide * ux)
+    shift_y = math.floor(slide * uy)
     px, py = int(cx), int(cy)
     pts = []
-    for ox, oy in BALL_STAR_OFFSETS:
-        x, y = mark_x + ox, mark_y + oy
-        if (x - px) * (x - px) + (y - py) * (y - py) > BALL_REACH_SQ:
-            continue  # keep the mark within the ball's own silhouette
-        if 0 <= x < WIDTH and 0 <= y < HEIGHT:
-            pts.append((x, y))
+    for dx, dy in BALL_OFFSETS:
+        cell = math.floor((dx - shift_x) / BALL_CHECKER_SIZE) + math.floor((dy - shift_y) / BALL_CHECKER_SIZE)
+        if cell % 2 == 0:
+            x, y = px + dx, py + dy
+            if 0 <= x < WIDTH and 0 <= y < HEIGHT:
+                pts.append((x, y))
     return pts
 
 
