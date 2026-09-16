@@ -258,9 +258,10 @@ def load_best_times():
 def save_best_time(level_index, seconds):
     """Records a new best time for level_index and rewrites the whole
     file -- see save_brightness() for the read-only-filesystem case.
-    Still updates the in-memory best_times in UNLOCKED_MODE (so any
-    "beat your best" feedback keeps working for the session) but never
-    writes it to disk -- see UNLOCKED_MODE's own comment."""
+    Still updates the in-memory best_times in UNLOCKED_MODE (so the
+    level-complete screen's "BEST TIME!" feedback keeps working for the
+    session) but never writes it to disk -- see UNLOCKED_MODE's own
+    comment."""
     best_times[level_index] = seconds
     if UNLOCKED_MODE:
         return True
@@ -273,13 +274,32 @@ def save_best_time(level_index, seconds):
         return False
 
 
+def clear_best_times():
+    """Wipes every recorded best time -- paired with save_progress(0) by
+    confirm_reset_progress() so Reset Progress actually resets
+    everything, not just which levels are unlocked. Returns True if the
+    write succeeded -- see save_brightness() for the read-only case.
+    Still clears the in-memory best_times in UNLOCKED_MODE, but leaves
+    the real file on disk untouched -- see UNLOCKED_MODE's own comment."""
+    best_times.clear()
+    if UNLOCKED_MODE:
+        return True
+    try:
+        with open(BEST_TIMES_PATH, "w"):
+            pass
+        return True
+    except OSError:
+        return False
+
+
 def format_time(seconds):
     return f"{seconds:.1f}s"
 
 
 menus.init(
     display, group, bitmap, palette, pot, WIDTH, HEIGHT,
-    ui_color, apply_brightness, save_brightness, save_calibration,
+    ui_color, apply_brightness, save_brightness, save_calibration, save_progress,
+    clear_best_times,
 )
 
 # Hold the right button on boot for a special session: every level
@@ -301,13 +321,18 @@ bar_pixels_list = []
 ball_rotation = 0.0
 ball_roll_direction = (1.0, 0.0)
 level_start_time = 0.0
-win_label = None
 
 
-def load_level(index):
+def load_level(index, reset_timer=True):
+    """reset_timer=False is for the in-game reset gesture (both buttons)
+    only -- it puts the ball back at the start like any other load, but
+    a level's completion time is meant to run continuously from the
+    moment you actually start/replay/advance to it, unaffected by
+    falling off (which doesn't call this at all -- see the main loop's
+    out-of-bounds handling) or manually resetting your position."""
     global current_level_index, current_start_x, current_start_y
     global spinners, ball_x, ball_y, vel_x, vel_y, ball_pixels, bar_pixels_list
-    global ball_rotation, ball_roll_direction, level_start_time, win_label
+    global ball_rotation, ball_roll_direction, level_start_time
 
     current_level_index = index
     current_start_x, current_start_y, spinners = LEVELS[index]()
@@ -317,11 +342,8 @@ def load_level(index):
     bar_pixels_list = []
     ball_rotation = 0.0
     ball_roll_direction = (1.0, 0.0)
-    level_start_time = time.monotonic()
-
-    if win_label is not None:
-        group.remove(win_label)
-        win_label = None
+    if reset_timer:
+        level_start_time = time.monotonic()
 
     update_bar_segments(spinners)
     for seg in bar_segments:
@@ -336,33 +358,18 @@ def load_level(index):
 
 
 def mark_level_won():
-    """Called the instant a level is won: records a best time and shows a
-    "NEW BEST" overlay with the time, but only when an *existing* best
-    gets beaten -- a level's first-ever completion just records the time
-    silently, since there's nothing yet for it to have beaten. Returns
-    how long, in seconds, to pause on the win screen before advancing."""
-    global win_label
+    """Called the instant a level is won: records a best time whenever
+    this run set or beat the record -- a level's first-ever completion
+    counts too, since there's nothing yet for it to have beaten. Returns
+    (elapsed_seconds, is_best) for menus.level_complete_screen() to show;
+    it owns the actual win screen and blocks on the player's replay/next
+    choice, so there's no timer here."""
     elapsed = time.monotonic() - level_start_time
     previous_best = best_times.get(current_level_index)
-    if previous_best is None:
+    is_best = previous_best is None or elapsed < previous_best
+    if is_best:
         save_best_time(current_level_index, elapsed)
-        return 1.0
-    is_new_best = elapsed < previous_best
-    if is_new_best:
-        save_best_time(current_level_index, elapsed)
-        win_label = label.Label(
-            terminalio.FONT,
-            text="NEW BEST\n" + format_time(elapsed),
-            color=ui_color(),
-            scale=1,
-        )
-        win_label.anchor_point = (0.5, 0.5)
-        win_label.anchored_position = (WIDTH // 2, HEIGHT // 2)
-        win_label.line_spacing = 0.9
-        group.append(win_label)
-        display.refresh(minimum_frames_per_second=0)
-        return 2.0
-    return 1.0
+    return elapsed, is_best
 
 
 furthest_level = (len(LEVELS) - 1) if UNLOCKED_MODE else load_progress()
@@ -397,8 +404,6 @@ while True:
     menus.countdown()
     load_level(start_index)
 
-    won = False
-    win_timer = 0.0
     backed_out = False
 
     while True:
@@ -407,26 +412,11 @@ while True:
             backed_out = True
             break
         if select:
-            load_level(current_level_index)
-            won = False
-            continue
-
-        if won:
-            win_timer -= 0.02
-            if win_timer <= 0:
-                reached = min(current_level_index + 1, len(LEVELS) - 1)
-                if reached > furthest_level:
-                    furthest_level = reached
-                    save_progress(furthest_level)
-                next_index = (current_level_index + 1) % len(LEVELS)
-                menus.countdown()
-                load_level(next_index)
-                won = False
-            time.sleep(0.02)
+            load_level(current_level_index, reset_timer=False)
             continue
 
         for sp in spinners:
-            sp["angle"] += sp["speed"]
+            sp["angle"] += sp["speed"] * sp["direction"]
         update_bar_segments(spinners)
         while len(bar_pixels_list) < len(bar_segments):
             bar_pixels_list.append([])
@@ -442,19 +432,24 @@ while True:
         )
 
         gx, gy = int(ball_x), int(ball_y)
-        hole_hit = None
-        for h in holes:
-            if point_segment_distance(ball_x, ball_y, h["x"], h["y"], h["x"], h["y"]) < HOLE_RADIUS:
-                hole_hit = h
-                break
 
         if 0 <= gx < WIDTH and 0 <= gy < HEIGHT and static_color[idx(gx, gy)] == 3:
-            won = True
-            win_timer = mark_level_won()
-        elif hole_hit is not None:
-            score += hole_hit["value"]
-            won = True
-            win_timer = mark_level_won()
+            elapsed, is_best = mark_level_won()
+            choice = menus.level_complete_screen(format_time(elapsed), is_best)
+            if choice == "replay":
+                load_level(current_level_index)
+            elif choice == "next":
+                reached = min(current_level_index + 1, len(LEVELS) - 1)
+                if reached > furthest_level:
+                    furthest_level = reached
+                    save_progress(furthest_level)
+                next_index = (current_level_index + 1) % len(LEVELS)
+                menus.countdown()
+                load_level(next_index)
+            else:  # backed out of the win screen
+                backed_out = True
+                break
+            continue
         elif (
             ball_x < -BALL_RADIUS - 2
             or ball_x > WIDTH + BALL_RADIUS + 2

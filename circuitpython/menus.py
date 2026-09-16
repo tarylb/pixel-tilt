@@ -36,12 +36,16 @@ ui_color = None
 apply_brightness = None
 save_brightness = None
 save_calibration = None
+save_progress = None
+clear_best_times = None
 
 
 def init(display_, group_, bitmap_, palette_, pot_, width, height,
-         ui_color_fn, apply_brightness_fn, save_brightness_fn, save_calibration_fn):
+         ui_color_fn, apply_brightness_fn, save_brightness_fn, save_calibration_fn,
+         save_progress_fn, clear_best_times_fn):
     global display, group, bitmap, palette, pot, WIDTH, HEIGHT
-    global ui_color, apply_brightness, save_brightness, save_calibration
+    global ui_color, apply_brightness, save_brightness, save_calibration, save_progress
+    global clear_best_times
     display = display_
     group = group_
     bitmap = bitmap_
@@ -53,6 +57,8 @@ def init(display_, group_, bitmap_, palette_, pot_, width, height,
     apply_brightness = apply_brightness_fn
     save_brightness = save_brightness_fn
     save_calibration = save_calibration_fn
+    save_progress = save_progress_fn
+    clear_best_times = clear_best_times_fn
 
 
 # How far a brightness adjustment steps per button press. The floor
@@ -154,6 +160,66 @@ def poll_buttons():
     return left_edge, right_edge, select_edge, back_edge
 
 
+# ---------- Centered multi-line text ----------
+# adafruit_display_text.label.Label doesn't center multi-line text
+# per-line -- a "\n"-separated Label's bounding box is sized to its
+# WIDEST line, and anchor_point/anchored_position only positions that
+# whole box, so every other, shorter line renders flush against the
+# long line's left edge instead of centered under/over it (e.g.
+# "RESET?\nboth=yes" -- "both=yes" would hang off to one side rather
+# than sitting centered beneath "RESET?"). The fix used everywhere in
+# this file is one Label per line, each individually centered.
+def _multiline_labels(text, scale=1, color=None):
+    """One Label per "\n"-separated line of text, unpositioned and not
+    yet added to any group -- see the module note above. Returns
+    (labels, heights); heights are each label's actual measured
+    bounding_box height (not a guessed constant -- see the level-select
+    and level-complete-screen fixes for why that matters on this font),
+    for a caller to use in its own vertical layout math before calling
+    _place_centered_lines()."""
+    if color is None:
+        color = ui_color()
+    lines = text.split("\n")
+    labels = [label.Label(terminalio.FONT, text=line, color=color, scale=scale) for line in lines]
+    heights = [lbl.bounding_box[3] if lbl.bounding_box else 8 * scale for lbl in labels]
+    return labels, heights
+
+
+def _place_centered_lines(parent_group, labels, heights, top_y):
+    """Stack labels (from _multiline_labels()) horizontally centered on
+    the display, starting at top_y and advancing downward by each
+    line's own height, appending each to parent_group as it's placed."""
+    y = top_y
+    for lbl, h in zip(labels, heights):
+        lbl.anchor_point = (0.5, 0.0)
+        lbl.anchored_position = (WIDTH // 2, y)
+        parent_group.append(lbl)
+        y += h
+
+
+def _clear_labels(parent_group, labels):
+    for lbl in labels:
+        parent_group.remove(lbl)
+
+
+def _set_centered_lines(parent_group, old_labels, text, scale=1, color=None, valign="center"):
+    """Replace old_labels (previously placed in parent_group by this
+    function) with a freshly built, per-line-centered rendering of text
+    -- the common case of _multiline_labels()/_place_centered_lines()
+    for a screen that's just showing one centered block of text and
+    needs to change it (a new prompt, a value ticking up/down, a result
+    message). valign="center" vertically centers the whole block in the
+    display; valign="top" pins its top edge to y=0 instead, for a screen
+    where something else (calibrate_pot()'s live bar) occupies the
+    bottom. Returns the new label list to pass back in next time."""
+    _clear_labels(parent_group, old_labels)
+    labels, heights = _multiline_labels(text, scale=scale, color=color)
+    total_h = sum(heights)
+    top_y = 0 if valign == "top" else max(0, (HEIGHT - total_h) // 2)
+    _place_centered_lines(parent_group, labels, heights, top_y)
+    return labels
+
+
 def countdown():
     text_area = label.Label(terminalio.FONT, text="3", color=ui_color(), scale=2)
     text_area.anchor_point = (0.5, 0.5)
@@ -187,22 +253,18 @@ def main_menu():
     ]
     index = 0
 
-    text_area = label.Label(terminalio.FONT, text=options[index][0], color=ui_color(), scale=1)
-    text_area.anchor_point = (0.5, 0.5)
-    text_area.line_spacing = 0.9
-    text_area.anchored_position = (WIDTH // 2, HEIGHT // 2)
     menu_group = displayio.Group()
-    menu_group.append(text_area)
     display.root_group = menu_group
+    current_labels = _set_centered_lines(menu_group, [], options[index][0])
 
     while True:
         left, right, select, _back = poll_buttons()
         if left:
             index = (index - 1) % len(options)
-            text_area.text = options[index][0]
+            current_labels = _set_centered_lines(menu_group, current_labels, options[index][0])
         elif right:
             index = (index + 1) % len(options)
-            text_area.text = options[index][0]
+            current_labels = _set_centered_lines(menu_group, current_labels, options[index][0])
         elif select:
             return options[index][1]
         display.refresh(minimum_frames_per_second=0)
@@ -212,21 +274,38 @@ def main_menu():
 def confirm_reset_progress():
     """Confirmation screen for the destructive Reset Progress menu item.
     A simultaneous press confirms (the same "choose this" gesture used
-    everywhere else); a lone tap of either button, or holding for
-    BACK_HOLD_SECONDS, cancels. Returns True if the user confirmed."""
-    prompt = label.Label(terminalio.FONT, text="RESET?\nboth=yes", color=ui_color(), scale=1)
-    prompt.anchor_point = (0.5, 0.5)
-    prompt.anchored_position = (WIDTH // 2, HEIGHT // 2)
-    prompt.line_spacing = 0.9
+    everywhere else) and, like set_brightness_screen()'s "Saved!" step,
+    shows the Reset!/Not saved result in this SAME group/prompt rather
+    than building a separate one for it -- one less display.root_group
+    swap (each of which has a visible flicker cost on this display) than
+    handing the result back to the caller to show its own message would
+    need. A lone tap of either button, or holding for BACK_HOLD_SECONDS,
+    cancels without resetting anything. Returns True if progress was
+    reset (the caller still needs this to also zero its own in-memory
+    furthest_level, which menus.py has no reason to know about)."""
     confirm_group = displayio.Group()
-    confirm_group.append(prompt)
     display.root_group = confirm_group
+    current_labels = _set_centered_lines(confirm_group, [], "RESET?\nboth=yes")
 
     while True:
         left, right, select, back = poll_buttons()
         if select:
+            # Both writes are attempted regardless of whether the first
+            # one succeeds -- they're independent files, and either
+            # could be the one a read-only filesystem happens to reject.
+            progress_saved = save_progress(0)
+            times_cleared = clear_best_times()
+            saved = progress_saved and times_cleared
+            current_labels = _set_centered_lines(
+                confirm_group, current_labels,
+                "Reset!" if saved else "Not saved\n(read-only)",
+            )
+            display.refresh(minimum_frames_per_second=0)
+            time.sleep(1.0)
+            display.root_group = group
             return True
         if left or right or back:
+            display.root_group = group
             return False
         display.refresh(minimum_frames_per_second=0)
         time.sleep(0.02)
@@ -245,13 +324,9 @@ def set_brightness_screen(current_brightness, min_brightness):
     def label_for(v):
         return f"Bright\n{int(round(v * 100))}%"
 
-    prompt = label.Label(terminalio.FONT, text=label_for(value), color=ui_color(value), scale=1)
-    prompt.anchor_point = (0.5, 0.5)
-    prompt.anchored_position = (WIDTH // 2, HEIGHT // 2)
-    prompt.line_spacing = 0.9
     brightness_group = displayio.Group()
-    brightness_group.append(prompt)
     display.root_group = brightness_group
+    current_labels = _set_centered_lines(brightness_group, [], label_for(value), color=ui_color(value))
 
     while True:
         left, right, select, back = poll_buttons()
@@ -262,8 +337,11 @@ def set_brightness_screen(current_brightness, min_brightness):
         elif select:
             apply_brightness(value)
             saved = save_brightness(value)
-            prompt.text = "Saved!" if saved else "Not saved\n(read-only)"
-            prompt.color = ui_color(value)
+            current_labels = _set_centered_lines(
+                brightness_group, current_labels,
+                "Saved!" if saved else "Not saved\n(read-only)",
+                color=ui_color(value),
+            )
             display.refresh(minimum_frames_per_second=0)
             time.sleep(1.0)
             return value
@@ -272,8 +350,7 @@ def set_brightness_screen(current_brightness, min_brightness):
             return original
         if left or right:
             apply_brightness(value)
-            prompt.color = ui_color(value)
-            prompt.text = label_for(value)
+            current_labels = _set_centered_lines(brightness_group, current_labels, label_for(value), color=ui_color(value))
         display.refresh(minimum_frames_per_second=0)
         time.sleep(0.02)
 
@@ -293,19 +370,16 @@ def calibrate_pot():
     calib_group = displayio.Group()
     calib_group.append(calib_tile_grid)
 
-    prompt = label.Label(terminalio.FONT, text="", color=ui_color(), scale=1)
-    prompt.anchor_point = (0.5, 0.5)
-    prompt.anchored_position = (WIDTH // 2, HEIGHT // 2)
-    prompt.line_spacing = 0.9
-    calib_group.append(prompt)
-
     for x in range(WIDTH):
         for y in range(HEIGHT):
             bitmap[x, y] = 0
     display.root_group = calib_group
 
+    prompt_labels = []
+
     def wait_for_any_press(text):
-        prompt.text = text
+        nonlocal prompt_labels
+        prompt_labels = _set_centered_lines(calib_group, prompt_labels, text)
         while True:
             left, right, select, back = poll_buttons()
             if back:
@@ -357,9 +431,11 @@ def calibrate_pot():
         frac = max(0.0, min(1.0, frac))
         return int(round(frac * (WIDTH - 2)))
 
-    prompt.text = ("Saved!" if saved else "Not saved") + "\nhold=done"
-    prompt.anchor_point = (0.5, 0.0)
-    prompt.anchored_position = (WIDTH // 2, 0)
+    prompt_labels = _set_centered_lines(
+        calib_group, prompt_labels,
+        ("Saved!" if saved else "Not saved") + "\nhold=done",
+        valign="top",
+    )
 
     while True:
         _left, _right, _select, back = poll_buttons()
@@ -371,6 +447,80 @@ def calibrate_pot():
 
     display.root_group = group
     return new_level, new_left, new_right
+
+
+def level_complete_screen(time_text, is_best):
+    """Shown right after finishing a level: the time just taken, and
+    "BEST TIME!" too if this run set or beat the record (is_best is the
+    caller's call -- see code.py's mark_level_won()). If there's enough
+    room left over, also shows a REPLAY / NEXT hint for the left/right
+    buttons, which is what actually drives what happens next -- there's
+    no auto-advance timer here, this blocks like any other menus.py
+    screen until the player picks one (or backs out the usual way).
+    Returns "replay", "next", or None if backed out.
+
+    "next" deliberately leaves display.root_group pointed at this
+    screen's own group instead of restoring it to the game's group first
+    -- code.py always follows "next" with countdown(), which sets its
+    own root_group as the very first thing it does, so swapping back to
+    the game's group (still showing the just-finished level, since
+    load_level() for the new one hasn't run yet) in between would just
+    be an extra, unnecessary hop through stale content -- and swapping
+    root_group has a visible flicker/glitch cost on this display, worth
+    avoiding when there's nothing to show for it."""
+    comp_group = displayio.Group()
+
+    lines_text = ("BEST TIME!\n" + time_text) if is_best else ("TIME\n" + time_text)
+    main_labels, main_heights = _multiline_labels(lines_text)
+    main_h = sum(main_heights)
+
+    replay_label = label.Label(terminalio.FONT, text="REPLAY", color=ui_color(), scale=1)
+    replay_label.anchor_point = (0.0, 0.0)
+    next_label = label.Label(terminalio.FONT, text="NEXT", color=ui_color(), scale=1)
+    next_label.anchor_point = (1.0, 0.0)
+
+    # Measured, not guessed -- terminalio.FONT's glyphs render taller
+    # than you'd expect from the display's 32px height (see the level
+    # select bottom-clipping fix), so whether the hint row actually fits
+    # underneath the time text has to be checked against its real
+    # rendered size rather than an assumed constant.
+    hint_h = max(
+        replay_label.bounding_box[3] if replay_label.bounding_box else 8,
+        next_label.bounding_box[3] if next_label.bounding_box else 8,
+    )
+    replay_w = replay_label.bounding_box[2] if replay_label.bounding_box else 36
+    next_w = next_label.bounding_box[2] if next_label.bounding_box else 24
+    hint_gap = 2
+    show_hints = (
+        main_h + hint_gap + hint_h <= HEIGHT
+        and replay_w + next_w <= WIDTH
+    )
+
+    block_h = main_h + (hint_gap + hint_h if show_hints else 0)
+    top_y = max(0, (HEIGHT - block_h) // 2)
+    _place_centered_lines(comp_group, main_labels, main_heights, top_y)
+
+    if show_hints:
+        hint_y = top_y + main_h + hint_gap
+        replay_label.anchored_position = (0, hint_y)
+        next_label.anchored_position = (WIDTH, hint_y)
+        comp_group.append(replay_label)
+        comp_group.append(next_label)
+
+    display.root_group = comp_group
+    display.refresh(minimum_frames_per_second=0)
+
+    while True:
+        left, right, _select, back = poll_buttons()
+        if left:
+            display.root_group = group
+            return "replay"
+        if right:
+            return "next"
+        if back:
+            display.root_group = group
+            return None
+        time.sleep(0.02)
 
 
 def level_select(furthest_level, total_levels, best_times=None, format_time=None):
@@ -411,7 +561,21 @@ def level_select(furthest_level, total_levels, best_times=None, format_time=None
                 bitmap[x, y] = 0
         total_w = visible * box_w + (visible - 1) * gap
         start_x = (WIDTH - total_w) // 2
-        top_y = (HEIGHT - box_h) // 2
+
+        # Set the time label's text before measuring it -- its actual
+        # rendered height (from bounding_box, not a guessed constant) is
+        # what decides how far up the whole block needs to sit, since
+        # terminalio.FONT's glyphs are taller than the 12px boxes alone
+        # would suggest and previously ran the time text off the bottom
+        # of the display when centered on the boxes alone.
+        best = best_times.get(selected)
+        time_label.text = format_time(best) if best is not None and format_time else "--"
+        time_h = time_label.bounding_box[3] if time_label.bounding_box else 8
+        underline_h = 1
+        label_gap = 1
+        block_h = box_h + underline_h + label_gap + time_h
+        top_y = max(0, (HEIGHT - block_h) // 2)
+
         for i in range(visible):
             level_num = window_start + i
             bx = start_x + i * (box_w + gap)
@@ -429,9 +593,7 @@ def level_select(furthest_level, total_levels, best_times=None, format_time=None
             lbl.anchored_position = (bx + box_w // 2, top_y + box_h // 2)
             select_group.append(lbl)
             box_labels.append(lbl)
-        best = best_times.get(selected)
-        time_label.text = format_time(best) if best is not None and format_time else "--"
-        time_label.anchored_position = (WIDTH // 2, top_y + box_h + 1)
+        time_label.anchored_position = (WIDTH // 2, top_y + box_h + underline_h + label_gap)
         display.refresh(minimum_frames_per_second=0)
 
     redraw()
