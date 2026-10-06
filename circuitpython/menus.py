@@ -84,7 +84,7 @@ SIMULTANEOUS_WINDOW = 0.15
 # How long either button (or both) must be held continuously to fire the
 # universal "back out" gesture -- leaving a menu screen, aborting
 # calibration, or quitting an in-progress level back to the main menu.
-BACK_HOLD_SECONDS = 3.0
+BACK_HOLD_SECONDS = 2.0
 
 _prev_left = False
 _prev_right = False
