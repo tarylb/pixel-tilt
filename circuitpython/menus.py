@@ -449,15 +449,50 @@ def calibrate_pot():
     return new_level, new_left, new_right
 
 
+# Small hand-drawn 9x9 pixel icons for level_complete_screen's left/right
+# button hints, in place of "REPLAY"/"NEXT" text -- terminalio.FONT's
+# glyphs render tall enough (see level_complete_screen()) that the text
+# version left little vertical room to spare on this 32px-tall display.
+# Each is a list of (dx, dy) "on" pixels within its own ICON_SIZE x
+# ICON_SIZE box. ICON_REPLAY is a circle with a flat, double-thick top
+# (a wide arrowhead rather than a single angled tip) and a small notch
+# at (6, 2) marking the gap it loops back through, reading as a loop
+# with a direction (repeat/restart) rather than just a broken circle.
+ICON_SIZE = 9
+ICON_REPLAY = (
+    (5, 0), (6, 0), (7, 0),
+    (2, 1), (5, 1), (6, 1),
+    (1, 2), (5, 2), (7, 2),
+    (0, 3), (8, 3),
+    (0, 4), (8, 4),
+    (0, 5), (8, 5),
+    (1, 6), (7, 6),
+    (2, 7), (6, 7),
+    (3, 8), (4, 8), (5, 8),
+)
+ICON_NEXT = (
+    (4, 0),
+    (4, 1), (5, 1),
+    (4, 2), (5, 2), (6, 2),
+    (4, 3), (5, 3), (6, 3), (7, 3),
+    (0, 4), (1, 4), (2, 4), (3, 4), (4, 4), (5, 4), (6, 4), (7, 4), (8, 4),
+    (4, 5), (5, 5), (6, 5), (7, 5),
+    (4, 6), (5, 6), (6, 6),
+    (4, 7), (5, 7),
+    (4, 8),
+)
+ICON_COLOR = 6  # palette index 6 -- plain white, already brightness-scaled
+
+
 def level_complete_screen(time_text, is_best):
     """Shown right after finishing a level: the time just taken, and
     "BEST TIME!" too if this run set or beat the record (is_best is the
     caller's call -- see code.py's mark_level_won()). If there's enough
-    room left over, also shows a REPLAY / NEXT hint for the left/right
-    buttons, which is what actually drives what happens next -- there's
-    no auto-advance timer here, this blocks like any other menus.py
-    screen until the player picks one (or backs out the usual way).
-    Returns "replay", "next", or None if backed out.
+    room left over, also shows the ICON_REPLAY / ICON_NEXT hint icons
+    for the left/right buttons, which is what actually drives what
+    happens next -- there's no auto-advance timer here, this blocks like
+    any other menus.py screen until the player picks one (or backs out
+    the usual way). Returns "replay", "next", or None if backed out.
 
     "next" deliberately leaves display.root_group pointed at this
     screen's own group instead of restoring it to the game's group first
@@ -469,43 +504,51 @@ def level_complete_screen(time_text, is_best):
     root_group has a visible flicker/glitch cost on this display, worth
     avoiding when there's nothing to show for it."""
     comp_group = displayio.Group()
+    # The icons paint directly into the shared bitmap (like level_select's
+    # boxes), so this screen needs its own TileGrid for it -- and has to
+    # blank the whole thing first, since bitmap still holds whatever the
+    # game last drew. paint_static() reclaims it the same way on the way
+    # back into gameplay (see its docstring in code.py).
+    comp_group.append(displayio.TileGrid(bitmap, pixel_shader=palette))
+    for x in range(WIDTH):
+        for y in range(HEIGHT):
+            bitmap[x, y] = 0
+
+    # The icons sit flush in the top-left/top-right corners -- matching
+    # where the physical left/right buttons actually are on the board --
+    # rather than being tied to the text block's own position. The text
+    # block is then centered in whatever's left UNDER the icon row,
+    # instead of across the full display height: centering it across
+    # everything let a wide line like "BEST TIME!" stretch into the same
+    # top corners the icons occupy, since both independently gravitated
+    # toward the display's vertical center/top (this is also exactly why
+    # the icons -- and, before them, the REPLAY/NEXT text they replaced
+    # -- never actually appeared on real hardware: a dedicated hint row
+    # UNDERNEATH both lines never actually had room; reserving room
+    # ABOVE them instead, once, up front, avoids that fight entirely).
+    # icon_y/icon_gap flush against 0 (no top margin, no gap before the
+    # text starts) rather than a pixel of breathing room each -- the two
+    # stacked text lines below are already taller than the 32px display
+    # has room for on their own (terminalio.FONT's glyphs are tall; see
+    # _place_centered_lines()'s callers elsewhere), so every spare pixel
+    # here directly trades off against the text getting clipped at the
+    # bottom instead.
+    icon_y = 0
+    icon_gap = 0
+    show_hints = icon_y + ICON_SIZE <= HEIGHT and 2 * ICON_SIZE <= WIDTH
+    reserved_top = (icon_y + ICON_SIZE + icon_gap) if show_hints else 0
 
     lines_text = ("BEST TIME!\n" + time_text) if is_best else ("TIME\n" + time_text)
     main_labels, main_heights = _multiline_labels(lines_text)
     main_h = sum(main_heights)
-
-    replay_label = label.Label(terminalio.FONT, text="REPLAY", color=ui_color(), scale=1)
-    replay_label.anchor_point = (0.0, 0.0)
-    next_label = label.Label(terminalio.FONT, text="NEXT", color=ui_color(), scale=1)
-    next_label.anchor_point = (1.0, 0.0)
-
-    # Measured, not guessed -- terminalio.FONT's glyphs render taller
-    # than you'd expect from the display's 32px height (see the level
-    # select bottom-clipping fix), so whether the hint row actually fits
-    # underneath the time text has to be checked against its real
-    # rendered size rather than an assumed constant.
-    hint_h = max(
-        replay_label.bounding_box[3] if replay_label.bounding_box else 8,
-        next_label.bounding_box[3] if next_label.bounding_box else 8,
-    )
-    replay_w = replay_label.bounding_box[2] if replay_label.bounding_box else 36
-    next_w = next_label.bounding_box[2] if next_label.bounding_box else 24
-    hint_gap = 2
-    show_hints = (
-        main_h + hint_gap + hint_h <= HEIGHT
-        and replay_w + next_w <= WIDTH
-    )
-
-    block_h = main_h + (hint_gap + hint_h if show_hints else 0)
-    top_y = max(0, (HEIGHT - block_h) // 2)
+    top_y = reserved_top + max(0, (HEIGHT - reserved_top - main_h) // 2)
     _place_centered_lines(comp_group, main_labels, main_heights, top_y)
 
     if show_hints:
-        hint_y = top_y + main_h + hint_gap
-        replay_label.anchored_position = (0, hint_y)
-        next_label.anchored_position = (WIDTH, hint_y)
-        comp_group.append(replay_label)
-        comp_group.append(next_label)
+        for dx, dy in ICON_REPLAY:
+            bitmap[dx, icon_y + dy] = ICON_COLOR
+        for dx, dy in ICON_NEXT:
+            bitmap[WIDTH - ICON_SIZE + dx, icon_y + dy] = ICON_COLOR
 
     display.root_group = comp_group
     display.refresh(minimum_frames_per_second=0)
