@@ -579,7 +579,15 @@ def level_select(furthest_level, total_levels, best_times=None, format_time=None
     if best_times is None:
         best_times = {}
     total = total_levels
-    box_w = 9
+    # box_w has to fit the WIDEST level number that will ever be drawn
+    # in it -- "10" and up are wider than a single digit -- measured via
+    # a real Label's bounding_box rather than a guessed pixel width,
+    # same as time_label's height below: terminalio.FONT's glyphs don't
+    # reliably match a hand-picked per-character width. Only ever grows
+    # past the original 9px for 10+ levels; below that it's unchanged.
+    widest_label = label.Label(terminalio.FONT, text=str(total), color=ui_color(), scale=1)
+    widest_w = widest_label.bounding_box[2] if widest_label.bounding_box else 6 * len(str(total))
+    box_w = max(9, widest_w + 4)
     box_h = 12
     gap = 1
     visible = min(total, WIDTH // (box_w + gap))
