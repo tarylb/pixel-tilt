@@ -20,10 +20,10 @@ import rgbmatrix
 import analogio
 
 from physics import (
-    WIDTH, HEIGHT, BALL_RADIUS,
+    WIDTH, HEIGHT, BALL_RADIUS, BOOST_SPEED, GOAL_WIN_PIXELS,
     static_color, bar_segments,
-    idx, clear_level, apply_walls, apply_goals,
-    ball_pixels_at, bar_pixels_for_draw,
+    idx, clear_level, apply_walls, apply_goals, apply_spikes,
+    ball_pixels_at, ball_touches_color, segment_pixels_for_draw,
     update_bar_segments, step_ball, update_ball_roll, ball_accent_pixels_at,
 )
 import menus
@@ -41,15 +41,15 @@ matrix = rgbmatrix.RGBMatrix(
 )
 display = framebufferio.FramebufferDisplay(matrix, auto_refresh=False)
 
-bitmap = displayio.Bitmap(WIDTH, HEIGHT, 7)
-palette = displayio.Palette(7)
+bitmap = displayio.Bitmap(WIDTH, HEIGHT, 8)
+palette = displayio.Palette(8)
 
 # Full-brightness reference colors -- apply_brightness() scales these into
 # `palette` and into any UI text color (via ui_color()) so the whole
 # display, not just game elements, dims consistently. Index 5 (yellow) is
 # also what menus.py uses for the level-select underline -- it's not
 # just a game color, so keep it even though the game itself only uses
-# indices 0-4 and 6.
+# indices 0-4, 6, and 7.
 BASE_PALETTE_COLORS = (
     0x000000,
     0xFF3300,
@@ -58,6 +58,7 @@ BASE_PALETTE_COLORS = (
     0xAA00FF,
     0xFFFF00,
     0xFFFFFF,  # ball roll accent -- a bright star/sparkle against the red ball
+    0xFF1493,  # spikes -- pink, matching physics.py's set_cell() spike color
 )
 BALL_ROLL_ACCENT_COLOR = 6
 
@@ -127,6 +128,7 @@ def apply_level_data(data):
     clear_level()
     apply_walls(data["walls"])
     apply_goals(data["goals"])
+    apply_spikes(data.get("spikes", []))
     paint_static()
     sx, sy = data["start"]
     spinners = [
@@ -322,6 +324,20 @@ ball_rotation = 0.0
 ball_roll_direction = (1.0, 0.0)
 level_start_time = 0.0
 
+# One-time-per-level-attempt brake (left button: holds the ball near a
+# dead stop for a few frames) and boost (right button: a brief burst
+# above normal top speed -- see BOOST_SPEED in physics.py). Both are a
+# single use, restored by any load_level() call -- starting the level
+# over (replay, the reset gesture, or falling off and respawning) gives
+# you them back, same as the ball's position.
+BOOST_FRAMES = 11  # how long the burst lasts, in frames
+BRAKE_FRAMES = 55  # how long the hold lasts, in frames
+brake_used = False
+boost_used = False
+brake_frames_left = 0
+boost_frames_left = 0
+boost_dir = 0.0
+
 
 def load_level(index, reset_timer=True):
     """reset_timer=False is for the in-game reset gesture (both buttons)
@@ -333,10 +349,16 @@ def load_level(index, reset_timer=True):
     global current_level_index, current_start_x, current_start_y
     global spinners, ball_x, ball_y, vel_x, vel_y, ball_pixels, bar_pixels_list
     global ball_rotation, ball_roll_direction, level_start_time
+    global brake_used, boost_used, brake_frames_left, boost_frames_left, boost_dir
 
     current_level_index = index
     current_start_x, current_start_y, spinners = LEVELS[index]()
     ball_x, ball_y = current_start_x, current_start_y
+    brake_used = False
+    boost_used = False
+    brake_frames_left = 0
+    boost_frames_left = 0
+    boost_dir = 0.0
     vel_x, vel_y = 0.0, 0.0
     ball_pixels = []
     bar_pixels_list = []
@@ -347,7 +369,7 @@ def load_level(index, reset_timer=True):
 
     update_bar_segments(spinners)
     for seg in bar_segments:
-        pts = bar_pixels_for_draw(seg)
+        pts = segment_pixels_for_draw(seg)
         bar_pixels_list.append(draw_sprite(pts, 4, []))
 
     ball_pixels = draw_sprite(ball_pixels_at(ball_x, ball_y), 1, ball_pixels)
@@ -407,7 +429,7 @@ while True:
     backed_out = False
 
     while True:
-        _left, _right, select, back = menus.poll_buttons()
+        left, right, select, back = menus.poll_buttons()
         if back:
             backed_out = True
             break
@@ -421,19 +443,42 @@ while True:
         while len(bar_pixels_list) < len(bar_segments):
             bar_pixels_list.append([])
         for i, seg in enumerate(bar_segments):
-            pts = bar_pixels_for_draw(seg)
+            pts = segment_pixels_for_draw(seg)
             bar_pixels_list[i] = draw_sprite(pts, 4, bar_pixels_list[i])
 
         tilt = read_tilt()
+
+        if left and not brake_used:
+            brake_used = True
+            brake_frames_left = BRAKE_FRAMES
+        if right and not boost_used:
+            boost_used = True
+            boost_frames_left = BOOST_FRAMES
+            # Boost in whatever direction tilt is currently commanding;
+            # with no tilt at all, keep whatever direction (if any) the
+            # ball already has, defaulting to rightward from a dead stop
+            # rather than leaving the boost with no direction to use.
+            boost_dir = tilt if tilt != 0 else (1.0 if vel_x >= 0 else -1.0)
+
+        if brake_frames_left > 0:
+            brake_frames_left -= 1
+            brake = True
+        else:
+            brake = False
+
+        if boost_frames_left > 0:
+            boost_frames_left -= 1
+            boost = BOOST_SPEED if boost_dir > 0 else -BOOST_SPEED
+        else:
+            boost = 0.0
+
         prev_ball_x, prev_ball_y = ball_x, ball_y
-        ball_x, ball_y, vel_x, vel_y = step_ball(ball_x, ball_y, vel_x, vel_y, tilt)
+        ball_x, ball_y, vel_x, vel_y = step_ball(ball_x, ball_y, vel_x, vel_y, tilt, boost=boost, brake=brake)
         ball_roll_direction, ball_rotation = update_ball_roll(
             ball_roll_direction, ball_rotation, prev_ball_x, prev_ball_y, ball_x, ball_y
         )
 
-        gx, gy = int(ball_x), int(ball_y)
-
-        if 0 <= gx < WIDTH and 0 <= gy < HEIGHT and static_color[idx(gx, gy)] == 3:
+        if ball_touches_color(ball_x, ball_y, 3, min_count=GOAL_WIN_PIXELS):
             elapsed, is_best = mark_level_won()
             choice = menus.level_complete_screen(format_time(elapsed), is_best)
             if choice == "replay":
@@ -451,7 +496,8 @@ while True:
                 break
             continue
         elif (
-            ball_x < -BALL_RADIUS - 2
+            ball_touches_color(ball_x, ball_y, 7)  # spike -- instant death
+            or ball_x < -BALL_RADIUS - 2
             or ball_x > WIDTH + BALL_RADIUS + 2
             or ball_y < -BALL_RADIUS - 2
             or ball_y > HEIGHT + BALL_RADIUS + 2
@@ -459,6 +505,8 @@ while True:
             ball_x, ball_y = current_start_x, current_start_y
             vel_x, vel_y = 0.0, 0.0
             ball_rotation = 0.0
+            brake_frames_left = 0
+            boost_frames_left = 0
             ball_pixels = draw_sprite(ball_pixels_at(ball_x, ball_y), 1, ball_pixels)
             display.refresh(minimum_frames_per_second=0)
             time.sleep(0.02)

@@ -1,6 +1,6 @@
 # Pixel Tilt
 
-A tilt-maze game for a 64x32 RGB LED matrix, controlled by tilting the LED matrix panel. Roll the ball to the green goal while dodging spinning bars and rolling off walls and slopes.
+A tilt-maze game for a 64x32 RGB LED matrix, controlled by tilting the LED matrix panel. Roll the ball to the green goal while dodging spinning bars, spikes, and rolling off walls and slopes.
 
 ## Hardware
 
@@ -45,18 +45,18 @@ Requires `pygame` and `pygame_gui`. It's a plain desktop tool (not CircuitPython
 
 **Top menu bar (both modes)**
 - **File** — Save (to wherever was last opened/saved-as, no prompt); Save As... (always prompts, and that becomes the new "last" path); Open...
-- **Edit** — Undo / Redo (also `Ctrl+Z` / `Ctrl+Shift+Z`), scoped to the level currently open — switching levels, loading a file, New, or Delete all clear the history. A single Wall/Goal/Eraser drag undoes as one step, not one per pixel.
+- **Edit** — Undo / Redo (also `Ctrl+Z` / `Ctrl+Shift+Z`), scoped to the level currently open — switching levels, loading a file, New, or Delete all clear the history. A single Wall/Goal/Spike/Eraser drag undoes as one step, not one per pixel.
 - **Level** — New, Delete, Clear (wipes the current level but keeps it in the list), and a "Go to Level N" entry per level that exists
 - **Play button** — toggles Play/Edit (same as `Tab`); relabels itself "Edit" while playing, and the tool panel hides during Play since it isn't relevant there
 
 **Right-side panel (edit mode)**
-- Tool buttons — Wall, Wall Line, Goal, Ball start, Spinner, Eraser. There's no separate ramp type — a diagonal or staircase-shaped run of wall cells naturally acts like a slope, since the physics derives how much to roll (vs. bounce) a wall contact from how diagonal the local wall surface actually is, not from anything stored per cell. In practice this works well for steep runs (very roughly steeper than ~35°); much shallower/gentler diagonal runs can cause the ball to get stuck against them, since the ball is larger than the individual steps of a shallow staircase — worth testing a shallow slope before relying on it in a level.
-- Parameter controls for whichever tool is selected — Wall Line: thickness slider; Spinner: half-length, speed, and starting-angle sliders, plus a Direction button toggling clockwise/counterclockwise. Each new line/spinner picks up whatever the panel is currently set to.
-- Hovering the maze with Ball start / Spinner selected shows a dimmed preview of what clicking there would place; with Wall Line, once you've clicked the first point, hovering shows the line that a second click would paint.
+- Tool buttons — Wall, Wall Line, Goal, Spike, Ball start, Spinner, Eraser. Walls are continuous line segments, not pixel cells — there's no separate ramp type, and no grid-approximation limits on how shallow a slope can be: a wall at any angle rolls the ball at that exact angle (the physics reflects/rolls off the wall's true geometric angle), smoothly at any steepness. Spikes don't block movement like a wall — touching one kills the ball and respawns it at the start, same as falling off the edge.
+- Parameter controls for whichever tool is selected — Spinner: half-length, speed, and starting-angle sliders, plus a Direction button toggling clockwise/counterclockwise. Each new spinner picks up whatever the panel is currently set to. Walls all share one fixed thickness.
+- Hovering the maze with Ball start / Spinner selected shows a dimmed preview of what clicking there would place; with Wall Line, once you've clicked the first point, hovering shows the line that a second click would create.
 
 **Edit mode**
-- Left-drag — paint with Wall / Goal; with Eraser, clears whatever's directly under the cursor — a wall/goal cell, or a spinner if it touches its bar (a wall-line-drawn diagonal run is just more wall, erased pixel by pixel like any other)
-- Left-click — Wall Line: click a start point, then an end point to paint a straight line of wall cells; Ball: sets start position; Spinner: adds a new one using the panel's current parameters
+- Left-drag — Wall: freehand-draws a connected line (a polyline) following the cursor, one new wall per drag; paint with Goal / Spike; with Eraser, clears whatever's directly under the cursor — a whole wall (any point along it) or spinner (if it touches its bar) as one object, or a single goal/spike cell
+- Left-click — Wall Line: click a start point, then an end point to create a straight wall segment between them; Ball: sets start position; Spinner: adds a new one using the panel's current parameters
 
 **Play mode**
 - Mouse or arrows/`A`/`D` — tilt

@@ -30,30 +30,34 @@ TOP MENU BAR (both modes)
                      during Play since it isn't relevant there
 
 RIGHT-SIDE PANEL (edit mode)
-  Tool buttons    -- Wall, Wall Line, Goal, Ball start, Spinner, Eraser
-                     (there's no separate ramp type -- a diagonal run of
-                     wall cells naturally acts like a slope; see
-                     physics.py's step_ball() for how)
+  Tool buttons    -- Wall, Wall Line, Goal, Spike, Ball start, Spinner,
+                     Eraser. Walls are continuous line segments, not
+                     pixel cells -- a diagonal/angled wall rolls the ball
+                     smoothly at its own exact angle (see physics.py's
+                     step_ball()/_wall_normal() for how), not an
+                     approximation of one. Spikes don't block movement
+                     like a wall -- touching one kills the ball and
+                     respawns it at the start, same as falling off the
+                     edge.
   Parameter       -- shows controls for whichever tool is selected:
-  controls           Wall Line -> thickness slider
-                      Spinner -> half-length, speed, and starting-angle
+  controls           Spinner -> half-length, speed, and starting-angle
                                  sliders, plus a Direction button that
                                  toggles clockwise/counterclockwise
-                     Each new line/spinner placed picks up whatever the
-                     panel is currently set to. Hovering the maze with
-                     Ball start / Spinner selected shows a dimmed
-                     preview of what clicking there would place.
+                     Each new spinner placed picks up whatever the panel
+                     is currently set to. Hovering the maze with Ball
+                     start / Spinner selected shows a dimmed preview of
+                     what clicking there would place.
 
 EDIT MODE
-  Left-drag       -- paint with Wall / Goal; with Eraser, clears
-                     whatever's directly under the cursor -- a wall/
-                     goal cell, or a spinner if it touches its bar
-                     (a wall-line-drawn diagonal run is just more wall,
-                     erased pixel by pixel like any other)
+  Left-drag       -- Wall: freehand-draws a connected line (a polyline)
+                     following the cursor, one new wall per drag --
+                     paint with Goal / Spike; with Eraser, clears
+                     whatever's directly under the cursor -- a whole
+                     wall (any point along it) or spinner (if it
+                     touches its bar) as one object, or a single
+                     goal/spike cell
   Left-click      -- Wall Line: click a start point, then an end point
-                     to paint a straight line of wall cells (handy for
-                     a clean diagonal/staircase run without freehand
-                     dragging every pixel)
+                     to create a straight wall segment between them
                    -- Ball: sets the ball's start position
                    -- Spinner: adds a NEW one at that point, using
                      whatever the panel's parameters are set to (no
@@ -82,11 +86,11 @@ CIRCUITPYTHON_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "circuitpyth
 sys.path.insert(0, CIRCUITPYTHON_DIR)
 
 from physics import (  # noqa: E402 -- must follow the sys.path insert above
-    WIDTH, HEIGHT, BALL_RADIUS, BAR_HALF_THICKNESS,
+    WIDTH, HEIGHT, BALL_RADIUS, BAR_HALF_THICKNESS, BOOST_SPEED, GOAL_WIN_PIXELS,
     static_color, bar_segments,
     idx, set_cell, clear_cell, clear_level,
-    apply_walls, apply_goals, add_wall_line, wall_line_cells,
-    ball_pixels_at, bar_pixels_for_draw,
+    apply_walls, apply_goals, apply_spikes,
+    ball_pixels_at, ball_touches_color, segment_pixels_for_draw,
     point_segment_distance, update_bar_segments, step_ball, update_ball_roll,
     ball_accent_pixels_at,
 )
@@ -178,6 +182,32 @@ SCALE = 12
 PANEL_WIDTH = 220
 TOP_BAR_HEIGHT = 32
 
+TOOL_NAMES = {
+    1: "Wall", 2: "Wall Line", 3: "Goal", 4: "Ball start", 5: "Spinner",
+    6: "Eraser", 7: "Spike",
+}
+
+# ---------- Right-side panel layout ----------
+# Computed up front so PANEL_CONTENT_HEIGHT is known before the panel
+# (a scrolling container, see below) is created -- it's the panel's
+# full scrollable content height, which can run taller than the maze
+# area once there are enough tool buttons plus a parameter stack below
+# them (e.g. the Spinner's half-length/speed/angle/Direction group);
+# the panel scrolls to reach whatever doesn't fit rather than needing
+# the window stretched to fit it. BTN_W is NOT set here -- it depends
+# on the panel's actual inner width (narrower once its scrollbar
+# appears), so it's set once the panel exists, right before it's used.
+PANEL_PAD = 10
+BTN_H = 26
+BTN_GAP = 4
+PARAMS_Y = PANEL_PAD + len(TOOL_NAMES) * (BTN_H + BTN_GAP) + 10
+# The Spinner parameter stack (half-length, speed, start angle, each a
+# label+slider, then the Direction button) is currently the tallest
+# parameter group any tool shows -- its own bottom edge, relative to
+# PARAMS_Y, mirrors the widgets' actual relative_rect y-offsets below.
+SPINNER_PARAMS_BOTTOM = PARAMS_Y + 150 + 22
+PANEL_CONTENT_HEIGHT = SPINNER_PARAMS_BOTTOM + PANEL_PAD
+
 COLORS = {
     0: (10, 10, 14),
     1: (255, 51, 0),
@@ -185,6 +215,7 @@ COLORS = {
     3: (0, 255, 0),
     4: (170, 0, 255),
     5: (255, 255, 255),  # ball roll accent -- a bright star/sparkle against the red ball
+    7: (255, 20, 147),  # spikes -- matches physics.py's set_cell() spike color index
 }
 BALL_ROLL_ACCENT_COLOR = 5
 
@@ -214,7 +245,13 @@ def make_spinner(px, py, half_len=8, speed=0.04, start_angle=0.0, direction=1):
 # offset and the mouse-position-to-cell translation need to know about
 # the bar's height.
 pygame.init()
-WINDOW_SIZE = (WIDTH * SCALE + PANEL_WIDTH, TOP_BAR_HEIGHT + HEIGHT * SCALE)
+# The window is sized to the maze's own natural height -- the panel no
+# longer needs the window stretched to fit its content (which used to
+# leave a black bar under the playfield whenever the panel's content
+# was taller than the maze); it scrolls internally instead (see `panel`
+# below).
+MAZE_AREA_HEIGHT = HEIGHT * SCALE
+WINDOW_SIZE = (WIDTH * SCALE + PANEL_WIDTH, TOP_BAR_HEIGHT + MAZE_AREA_HEIGHT)
 screen = pygame.display.set_mode(WINDOW_SIZE)
 pygame.display.set_caption("Tilt Maze -- Level Editor")
 clock = pygame.time.Clock()
@@ -236,27 +273,49 @@ UI_THEME = {
 gui_manager = pygame_gui.UIManager(WINDOW_SIZE, UI_THEME)
 maze_surface = pygame.Surface((WIDTH * SCALE, HEIGHT * SCALE))
 
-TOOL_NAMES = {1: "Wall", 2: "Wall Line", 3: "Goal", 4: "Ball start", 5: "Spinner", 6: "Eraser"}
-
 # ---------- Multi-level state ----------
-# Each entry: {"start": (x, y), "walls": [(x0, x1, y), ...],
-#              "goals": [(x0, x1, y), ...],
+# Each entry: {"start": (x, y),
+#              "walls": [[(x0,y0), (x1,y1), ...], ...],
+#              "goals": [(x0, x1, y), ...], "spikes": [(x0, x1, y), ...],
 #              "spinners": [(pivot_x, pivot_y, half_len, speed,
 #                            start_angle_degrees, direction), ...]}
-# There's no separate ramp type -- the Wall Line tool paints a straight
-# diagonal run of plain wall cells (add_wall_line()), which reduces to
-# ordinary per-row spans in "walls" the same as any other wall shape, so
-# there's nothing extra to track or persist for it.
+# "walls" is a list of polylines -- each a list of >=1 points, consecutive
+# pairs becoming one collision segment each (see apply_walls() in
+# physics.py, whose actual math is fully continuous/float-based
+# regardless of what produced the points). A straight Wall Line is just
+# a 2-point polyline; a freehand Wall stroke is an N-point one -- both
+# tools place their points on the whole-pixel grid (same as Ball
+# start/Spinner), not the raw continuous mouse position. There's no
+# separate ramp type -- a wall at any angle rolls the ball at that exact
+# angle (see physics.py's step_ball()), nothing extra to track per wall.
 levels_data = []
 current_level_idx = 0
 
 current_start_x, current_start_y = 25, 6
 ball_start_set = False  # True once a ball start has actually been placed/loaded
 spinners = []
+walls = []  # list of polylines -- see the "Multi-level state" comment above
 mode = "edit"
 tool = 1
 line_click_start = None
-line_thickness = 1
+# The in-progress freehand Wall stroke's points (tool 1), or None when not
+# currently dragging one. Points are whole-pixel grid cells (same as
+# Wall Line/Ball start/Spinner), not the raw continuous mouse position --
+# appended to only when the cursor has moved into a DIFFERENT cell than
+# the last one recorded (see FREEHAND_MIN_STEP) to avoid flooding
+# duplicate points every frame it's held over the same cell; flushed
+# into `walls` on release.
+current_freehand_points = None
+FREEHAND_MIN_STEP = 0.5
+# How close a click needs to land to a wall's true line to erase it (see
+# wall_at_point()) -- deliberately its own constant rather than reusing
+# physics.py's WALL_HALF_THICKNESS (a small collision-only buffer, not
+# imported here at all -- see its comment in physics.py), which is far
+# too tight a margin for a click to reliably land inside. This is purely
+# an editor click-forgiveness margin, same role BAR_HALF_THICKNESS + 0.5
+# plays for erasing a spinner (see thing_at_cell()), with no physics
+# meaning.
+WALL_ERASE_TOLERANCE = 1.5
 spinner_half_len = 8
 spinner_speed = 0.04
 spinner_start_angle_deg = 0
@@ -268,22 +327,49 @@ ball_roll_direction = (1.0, 0.0)
 won = False
 win_timer = 0.0
 
+# One-time-per-attempt brake (Left Shift) / boost (Space) -- mirrors
+# code.py's board-button mapping (left=brake, right=boost) so the same
+# feel can be playtested here. See physics.py's step_ball() `boost`
+# parameter and code.py's BOOST_* handling for the on-device version.
+BOOST_FRAMES = 11
+BRAKE_FRAMES = 55
+brake_used = False
+boost_used = False
+boost_requested = False  # set on Space's keydown, consumed once tilt is known
+brake_frames_left = 0
+boost_frames_left = 0
+boost_dir = 0.0
+
 
 # ---------- Right-side GUI panel ----------
 # Tool buttons replace the old number-key shortcuts; the parameter group
-# below them swaps to match whichever tool is selected (Wall Line ->
-# thickness, Spinner -> half-length/speed/angle) since only one tool's
-# parameters are ever relevant at a time.
+# below them swaps to match whichever tool is selected (currently just
+# Spinner -> half-length/speed/angle/direction) since only one tool's
+# parameters are ever relevant at a time. Walls have a single fixed
+# WALL_HALF_THICKNESS (see physics.py) rather than a per-wall setting, so
+# neither Wall tool needs a parameter control. (PANEL_PAD/BTN_W/BTN_H/
+# BTN_GAP/PARAMS_Y are all defined earlier, up with TOOL_NAMES.)
 PANEL_X = WIDTH * SCALE
-PANEL_PAD = 10
-BTN_W = PANEL_WIDTH - 2 * PANEL_PAD
-BTN_H = 26
-BTN_GAP = 4
 
-panel = pygame_gui.elements.UIPanel(
-    relative_rect=pygame.Rect(PANEL_X, TOP_BAR_HEIGHT, PANEL_WIDTH, HEIGHT * SCALE),
+# A scrolling container rather than a plain panel -- its content
+# (PANEL_CONTENT_HEIGHT, from the tool buttons down through the Spinner
+# parameter stack) is taller than the maze area whenever there are
+# enough tools/params, and this lets that overflow scroll into view
+# instead of requiring the window itself to grow to fit it (which used
+# to leave a black bar under the playfield).
+panel = pygame_gui.elements.UIScrollingContainer(
+    relative_rect=pygame.Rect(PANEL_X, TOP_BAR_HEIGHT, PANEL_WIDTH, MAZE_AREA_HEIGHT),
     manager=gui_manager,
+    allow_scroll_x=False,
 )
+panel.set_scrollable_area_dimensions((PANEL_WIDTH, PANEL_CONTENT_HEIGHT))
+# The vertical scrollbar (shown whenever PANEL_CONTENT_HEIGHT exceeds
+# the visible MAZE_AREA_HEIGHT, which is the whole reason it's a
+# scrolling container) eats into the container's own width, so widgets
+# need to be sized off its actual inner width rather than the full
+# PANEL_WIDTH -- otherwise a widget would run under/behind the
+# scrollbar instead of stopping short of it.
+BTN_W = panel.get_container().get_abs_rect().width - 2 * PANEL_PAD
 
 tool_buttons = {}
 for i, tool_id in enumerate(sorted(TOOL_NAMES)):
@@ -296,19 +382,6 @@ for i, tool_id in enumerate(sorted(TOOL_NAMES)):
     )
     tool_buttons[tool_id] = btn
 tool_buttons[tool].select()
-
-PARAMS_Y = PANEL_PAD + len(TOOL_NAMES) * (BTN_H + BTN_GAP) + 10
-
-line_thickness_label = pygame_gui.elements.UILabel(
-    relative_rect=pygame.Rect(PANEL_PAD, PARAMS_Y, BTN_W, 20),
-    text=f"Line thickness: {line_thickness}",
-    manager=gui_manager, container=panel,
-)
-line_thickness_slider = pygame_gui.elements.UIHorizontalSlider(
-    relative_rect=pygame.Rect(PANEL_PAD, PARAMS_Y + 22, BTN_W, 22),
-    start_value=line_thickness, value_range=(1, 5), click_increment=1,
-    manager=gui_manager, container=panel,
-)
 
 spinner_half_len_label = pygame_gui.elements.UILabel(
     relative_rect=pygame.Rect(PANEL_PAD, PARAMS_Y, BTN_W, 20),
@@ -349,14 +422,13 @@ spinner_direction_button = pygame_gui.elements.UIButton(
     manager=gui_manager, container=panel,
 )
 
-LINE_PARAM_WIDGETS = (line_thickness_label, line_thickness_slider)
 SPINNER_PARAM_WIDGETS = (
     spinner_half_len_label, spinner_half_len_slider,
     spinner_speed_label, spinner_speed_slider,
     spinner_start_angle_label, spinner_start_angle_slider,
     spinner_direction_button,
 )
-ALL_PARAM_WIDGETS = LINE_PARAM_WIDGETS + SPINNER_PARAM_WIDGETS
+ALL_PARAM_WIDGETS = SPINNER_PARAM_WIDGETS
 
 
 def sync_panel_to_tool():
@@ -369,10 +441,7 @@ def sync_panel_to_tool():
             btn.unselect()
     for w in ALL_PARAM_WIDGETS:
         w.hide()
-    if tool == 2:
-        for w in LINE_PARAM_WIDGETS:
-            w.show()
-    elif tool == 5:
+    if tool == 5:
         for w in SPINNER_PARAM_WIDGETS:
             w.show()
 
@@ -447,14 +516,31 @@ def open_menu(name):
     items = menu_items_for(name)
     item_h = 26
     panel_w = 160
-    panel = pygame_gui.elements.UIPanel(
-        relative_rect=pygame.Rect(header_rect.left, TOP_BAR_HEIGHT, panel_w, len(items) * item_h + 8),
+    content_h = len(items) * item_h + 8
+    # Level's item count grows with the level list (New/Delete/Clear plus
+    # one "Go to Level N" per level) and will eventually not fit below the
+    # top bar -- a plain UIPanel would just run off the bottom of the
+    # window uncropped. A scrolling container clips to whatever vertical
+    # space is actually available and lets the rest scroll into view,
+    # instead of growing the panel (and therefore the window) to fit
+    # content that only exists while the dropdown happens to be open.
+    available_h = max(item_h + 8, WINDOW_SIZE[1] - TOP_BAR_HEIGHT)
+    panel_h = min(content_h, available_h)
+    panel = pygame_gui.elements.UIScrollingContainer(
+        relative_rect=pygame.Rect(header_rect.left, TOP_BAR_HEIGHT, panel_w, panel_h),
         manager=gui_manager,
+        allow_scroll_x=False,
     )
+    panel.set_scrollable_area_dimensions((panel_w, content_h))
+    # The scrollbar (when the content doesn't all fit) eats into the
+    # container's own width, so size buttons off its actual inner width
+    # rather than panel_w -- otherwise a button would run under/behind
+    # the scrollbar instead of stopping short of it.
+    inner_w = panel.get_container().get_abs_rect().width
     actions = {}
     for i, (label, action) in enumerate(items):
         btn = pygame_gui.elements.UIButton(
-            relative_rect=pygame.Rect(4, 4 + i * item_h, panel_w - 8, item_h - 2),
+            relative_rect=pygame.Rect(4, 4 + i * item_h, inner_w - 8, item_h - 2),
             text=label, manager=gui_manager, container=panel,
         )
         actions[btn] = action
@@ -472,25 +558,25 @@ def toggle_menu(name):
 
 
 def snapshot_current_level():
-    walls = []
     goals = []
+    spikes = []
     for y in range(HEIGHT):
         x = 0
         while x < WIDTH:
             sc = static_color[idx(x, y)]
-            if sc == 0:
+            if sc == 0 or sc == 2:
+                # 0 = empty; 2 = wall -- walls are no longer grid-derived,
+                # the live `walls` list below is the authoritative source.
                 x += 1
                 continue
-            if sc == 2:
-                x2 = x
-                while x2 + 1 < WIDTH and static_color[idx(x2 + 1, y)] == 2:
-                    x2 += 1
-                walls.append((x, x2, y))
-            else:  # sc == 3, goal
-                x2 = x
-                while x2 + 1 < WIDTH and static_color[idx(x2 + 1, y)] == 3:
-                    x2 += 1
-                goals.append((x, x2, y))
+            if sc == 3:
+                span, target = goals, 3
+            else:  # sc == 7, spike
+                span, target = spikes, 7
+            x2 = x
+            while x2 + 1 < WIDTH and static_color[idx(x2 + 1, y)] == target:
+                x2 += 1
+            span.append((x, x2, y))
             x = x2 + 1
     # pivot_x/pivot_y saved as whole numbers -- like the ball start, a
     # spinner is always placed on the pixel grid (see the Spinner tool's
@@ -511,14 +597,22 @@ def snapshot_current_level():
     # pixel grid (see the Ball start tool's click handler), so the
     # fractional part is always .0 anyway.
     start = (int(current_start_x), int(current_start_y))
-    return {"start": start, "walls": walls, "goals": goals, "spinners": sps}
+    # A shallow copy of `walls` -- each polyline list inside it is only
+    # ever replaced wholesale (appended to `walls`/removed from it), never
+    # mutated in place, so sharing those inner lists between this
+    # snapshot and the live editor state is safe; only the outer list
+    # needs to be independent so a later live edit (walls.append(...))
+    # can't also silently rewrite an already-saved undo/redo snapshot.
+    return {"start": start, "walls": list(walls), "goals": goals, "spikes": spikes, "spinners": sps}
 
 
 def apply_level_snapshot(data):
-    global current_start_x, current_start_y, spinners, ball_start_set
+    global current_start_x, current_start_y, spinners, ball_start_set, walls
     clear_level()
-    apply_walls(data["walls"])
+    walls = list(data["walls"])
+    apply_walls(walls)
     apply_goals(data["goals"])
+    apply_spikes(data.get("spikes", []))  # .get: older saved levels predate spikes
     current_start_x, current_start_y = data["start"]
     ball_start_set = True
     spinners = [
@@ -598,7 +692,7 @@ def new_level():
         # (even if it's just the blank default) becomes level 1, rather
         # than being discarded.
         levels_data.append(snapshot_current_level())
-    blank = {"start": (32, 16), "walls": [], "goals": [], "spinners": []}
+    blank = {"start": (32, 16), "walls": [], "goals": [], "spikes": [], "spinners": []}
     levels_data.append(blank)
     current_level_idx = len(levels_data) - 1
     apply_level_snapshot(blank)
@@ -616,11 +710,19 @@ def delete_current_level():
     clear_undo_history()
 
 
-def format_json(obj, indent=0):
+def format_json(obj, indent=0, max_width=100):
     """Like json.dumps(obj, indent=2), except an array is only broken
     onto multiple lines if it holds objects or arrays of its own --  a
-    "leaf" array of plain numbers/strings (a cell span, an [x, y] start
-    point, ...) stays on one line instead of one number per line."""
+    "leaf" array of plain numbers/strings (a cell span, an [x, y] point,
+    ...) stays on one line instead of one number per line. And when an
+    array's elements are ALL leaf arrays themselves (goals/spikes' short
+    [x0, x1, y] spans, a wall polyline's own [x, y] points, ...), pack as
+    many as fit within max_width per line instead of one each -- one-per-
+    line made levels_data.json far longer than the data actually needs.
+    If the WHOLE packed result would fit on a single line anyway (a
+    short wall -- e.g. a straight 2-point Wall Line -- or a short list of
+    goal/spike spans), collapse it to just that one line rather than
+    still wrapping it in its own opening-/closing-bracket lines."""
     pad = "  " * indent
     pad_in = "  " * (indent + 1)
     if isinstance(obj, dict):
@@ -631,6 +733,22 @@ def format_json(obj, indent=0):
     if isinstance(obj, (list, tuple)):
         if not obj:
             return "[]"
+        is_leaf = lambda v: not isinstance(v, (dict, list, tuple))
+        if obj and all(isinstance(v, (list, tuple)) and all(is_leaf(x) for x in v) for v in obj):
+            rendered = [json.dumps(list(v)) for v in obj]
+            one_line = "[" + ", ".join(rendered) + "]"
+            if len(pad) + len(one_line) <= max_width:
+                return one_line
+            lines, line = [], pad_in
+            for i, r in enumerate(rendered):
+                piece = r + ("," if i < len(rendered) - 1 else "")
+                if line != pad_in and len(line) + 1 + len(piece) > max_width:
+                    lines.append(line)
+                    line = pad_in + piece
+                else:
+                    line += (" " if line != pad_in else "") + piece
+            lines.append(line)
+            return "[\n" + "\n".join(lines) + "\n" + pad + "]"
         if any(isinstance(v, (dict, list, tuple)) for v in obj):
             items = [pad_in + format_json(v, indent + 1) for v in obj]
             return "[\n" + ",\n".join(items) + "\n" + pad + "]"
@@ -665,6 +783,7 @@ def load_levels_from_file(path=None):
     else:
         clear_level()
         spinners.clear()
+        walls.clear()
     clear_undo_history()
     restart_ball()
     print(f"Loaded {len(levels_data)} levels from {path}")
@@ -703,10 +822,11 @@ def clear_current_level():
     push_undo()
     clear_level()
     spinners.clear()
+    walls.clear()
 
 
 def enter_play_mode():
-    global mode, line_click_start
+    global mode, line_click_start, current_freehand_points
     if mode != "edit":
         return
     if not ball_start_set:
@@ -721,6 +841,7 @@ def enter_play_mode():
         levels_data.append(snapshot_current_level())
     mode = "play"
     line_click_start = None
+    current_freehand_points = None
     panel.hide()
     play_button.set_text("Edit")
     countdown()
@@ -742,14 +863,24 @@ def cell_from_mouse(pos):
     return pos[0] // SCALE, (pos[1] - TOP_BAR_HEIGHT) // SCALE
 
 
+def point_from_mouse(pos):
+    """Like cell_from_mouse(), but the exact continuous (float) maze
+    coordinate under the cursor, not rounded down to a grid cell. Wall
+    points themselves are always whole pixel cells (see
+    current_freehand_points); this continuous version is only used for
+    the Eraser's wall-proximity check, where sub-pixel precision in the
+    cursor's own position is useful for deciding what's "close enough"
+    without snapping the cursor itself to a cell first."""
+    return pos[0] / SCALE, (pos[1] - TOP_BAR_HEIGHT) / SCALE
+
+
 def thing_at_cell(x, y):
     """Return ('spinner', obj) for a spinner the Eraser is directly
     touching at grid cell (x, y), or None -- only hits when the cursor
     is actually on the spinner's bar, so dragging the Eraser across a
-    plain wall cell can't accidentally delete a spinner elsewhere on the
-    level. Wall cells (including a wall-line-drawn diagonal run --
-    there's no separate tracked object for those) are erased directly by
-    the caller instead, one pixel at a time like any other wall."""
+    wall can't accidentally delete a spinner elsewhere on the level.
+    Walls are checked separately (see wall_at_point()), and goal/spike
+    cells are erased directly by the caller, one pixel at a time."""
     for sp in spinners:
         # Computed directly (matching update_bar_segments()'s formula)
         # rather than read from the shared bar_segments list, since that
@@ -765,12 +896,36 @@ def thing_at_cell(x, y):
     return None
 
 
+def wall_at_point(x, y):
+    """The wall polyline (a direct reference into `walls`) the Eraser is
+    touching at the continuous point (x, y), or None -- erases a whole
+    wall as one object (any point along it), same as a spinner, rather
+    than trimming individual points out of it."""
+    for w in walls:
+        if len(w) == 1:
+            x0, y0 = w[0]
+            if point_segment_distance(x, y, x0, y0, x0, y0) <= WALL_ERASE_TOLERANCE:
+                return w
+        else:
+            for (x0, y0), (x1, y1) in zip(w, w[1:]):
+                if point_segment_distance(x, y, x0, y0, x1, y1) <= WALL_ERASE_TOLERANCE:
+                    return w
+    return None
+
+
 def restart_ball():
     global ball_x, ball_y, vel_x, vel_y, ball_rotation, ball_roll_direction
+    global brake_used, boost_used, boost_requested, brake_frames_left, boost_frames_left, boost_dir
     ball_x, ball_y = current_start_x, current_start_y
     vel_x, vel_y = 0.0, 0.0
     ball_rotation = 0.0
     ball_roll_direction = (1.0, 0.0)
+    brake_used = False
+    boost_used = False
+    boost_requested = False
+    brake_frames_left = 0
+    boost_frames_left = 0
+    boost_dir = 0.0
 
 
 def draw_pixel_cells(pixels, color):
@@ -851,8 +1006,8 @@ def draw_tool_preview():
     if tool == 2:
         if line_click_start is None:
             return
-        cells = wall_line_cells(line_click_start[0], line_click_start[1], x, y, line_thickness)
-        draw_pixel_cells(cells, dim_color(COLORS[2]))
+        seg = (line_click_start[0], line_click_start[1], x, y)
+        draw_pixel_cells(segment_pixels_for_draw(seg), dim_color(COLORS[2]))
     elif tool == 4:
         draw_pixel_cells(ball_pixels_at(x, y), dim_color(COLORS[1]))
     elif tool == 5:
@@ -861,7 +1016,7 @@ def draw_tool_preview():
             x - spinner_half_len * math.cos(a), y - spinner_half_len * math.sin(a),
             x + spinner_half_len * math.cos(a), y + spinner_half_len * math.sin(a),
         )
-        draw_pixel_cells(bar_pixels_for_draw(seg), dim_color(COLORS[4]))
+        draw_pixel_cells(segment_pixels_for_draw(seg), dim_color(COLORS[4]))
 
 
 def draw_board():
@@ -872,10 +1027,19 @@ def draw_board():
             if c:
                 pygame.draw.rect(maze_surface, COLORS[c], (x * SCALE, y * SCALE, SCALE - 1, SCALE - 1))
     for seg in bar_segments:
-        draw_pixel_cells(bar_pixels_for_draw(seg), COLORS[4])
+        draw_pixel_cells(segment_pixels_for_draw(seg), COLORS[4])
 
 
 def blit_maze_and_flip():
+    # Clear the whole screen first -- the maze blit only covers the maze
+    # area, and used to rely on pygame_gui fully repainting its own
+    # top-bar/panel pixels every frame on top of whatever was already
+    # there. That held as long as nothing in those areas ever moved, but
+    # the side panel's UIScrollingContainer shifts its widgets' drawn
+    # position as it scrolls -- without a clear, each widget's previous
+    # position (now empty space, not covered by any widget) never gets
+    # painted over, leaving a ghost trail behind it as it scrolls.
+    screen.fill((0, 0, 0))
     screen.blit(maze_surface, (0, TOP_BAR_HEIGHT))
     gui_manager.draw_ui(screen)
     pygame.display.flip()
@@ -894,9 +1058,11 @@ def countdown():
 
 
 def pump_events():
-    global mode, tool, line_click_start, current_start_x, current_start_y
-    global line_thickness, spinner_half_len, spinner_speed
+    global mode, tool, line_click_start, current_freehand_points
+    global current_start_x, current_start_y
+    global spinner_half_len, spinner_speed
     global spinner_start_angle_deg, spinner_direction, ball_start_set
+    global brake_used, boost_used, boost_requested, brake_frames_left
     for event in pygame.event.get():
         gui_manager.process_events(event)
 
@@ -930,6 +1096,8 @@ def pump_events():
                 tool = next(t for t, b in tool_buttons.items() if b is event.ui_element)
                 if tool != 2:
                     line_click_start = None
+                if tool != 1:
+                    current_freehand_points = None
                 sync_panel_to_tool()
             elif event.ui_element is spinner_direction_button:
                 spinner_direction *= -1
@@ -937,10 +1105,7 @@ def pump_events():
             continue
 
         if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
-            if event.ui_element is line_thickness_slider:
-                line_thickness = int(round(event.value))
-                line_thickness_label.set_text(f"Line thickness: {line_thickness}")
-            elif event.ui_element is spinner_half_len_slider:
+            if event.ui_element is spinner_half_len_slider:
                 spinner_half_len = int(round(event.value))
                 spinner_half_len_label.set_text(f"Half-length: {spinner_half_len}")
             elif event.ui_element is spinner_speed_slider:
@@ -975,6 +1140,12 @@ def pump_events():
                     goto_level(current_level_idx + 1, save_first=False)
                 elif event.key == pygame.K_r:
                     restart_ball()
+                elif event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT) and not brake_used:
+                    brake_used = True
+                    brake_frames_left = BRAKE_FRAMES
+                elif event.key == pygame.K_SPACE and not boost_used:
+                    boost_used = True
+                    boost_requested = True
 
         if mode == "edit" and event.type == pygame.MOUSEBUTTONDOWN:
             if (
@@ -990,7 +1161,8 @@ def pump_events():
                         line_click_start = pos
                     else:
                         push_undo()
-                        add_wall_line(line_click_start[0], line_click_start[1], pos[0], pos[1], line_thickness)
+                        walls.append([line_click_start, pos])
+                        apply_walls(walls)
                         line_click_start = None
                 elif tool == 4:
                     push_undo()
@@ -1008,30 +1180,52 @@ painting_stroke_active = False
 
 
 def handle_edit_painting():
-    global painting_stroke_active
-    if mode != "edit" or tool not in (1, 3, 6):
+    global painting_stroke_active, current_freehand_points
+    if mode != "edit" or tool not in (1, 3, 6, 7):
         painting_stroke_active = False
+        current_freehand_points = None
         return
     if not pygame.mouse.get_pressed()[0]:
+        if tool == 1 and current_freehand_points:
+            # Flush the finished stroke as one new wall -- even a stroke
+            # that never moved far enough to gain a second point is kept
+            # (a 1-point "wall" is a valid point obstacle; see
+            # apply_walls() in physics.py), so a single click-and-release
+            # with this tool still places something.
+            walls.append(current_freehand_points)
+            apply_walls(walls)
         painting_stroke_active = False
+        current_freehand_points = None
         return
     cell = hover_cell()
     if cell is None:
         return
+    x, y = cell
     if not painting_stroke_active:
         push_undo()
         painting_stroke_active = True
-    x, y = cell
+        if tool == 1:
+            current_freehand_points = [(x, y)]
     if tool == 1:
-        set_cell(x, y, wall=True)
+        last_x, last_y = current_freehand_points[-1]
+        if math.hypot(x - last_x, y - last_y) >= FREEHAND_MIN_STEP:
+            current_freehand_points.append((x, y))
     elif tool == 3:
         set_cell(x, y, goal=True)
+    elif tool == 7:
+        set_cell(x, y, spike=True)
     elif tool == 6:
         found = thing_at_cell(x, y)
-        if found is None:
-            clear_cell(x, y)
-        else:
+        if found is not None:
             spinners.remove(found[1])
+        else:
+            point = point_from_mouse(pygame.mouse.get_pos())
+            wall = wall_at_point(point[0], point[1])
+            if wall is not None:
+                walls.remove(wall)
+                apply_walls(walls)
+            else:
+                clear_cell(x, y)
 
 
 # ---------- Startup: always begin empty; use L to load a levels_data.json ----------
@@ -1039,6 +1233,7 @@ levels_data = []
 current_level_idx = 0
 clear_level()
 spinners = []
+walls = []
 
 restart_ball()
 
@@ -1106,19 +1301,35 @@ while True:
             SENSITIVITY_CURVE = 2.0
             tilt = math.copysign(abs(raw_tilt) ** SENSITIVITY_CURVE, raw_tilt)
 
+    if boost_requested:
+        boost_requested = False
+        boost_frames_left = BOOST_FRAMES
+        boost_dir = tilt if tilt != 0 else (1.0 if vel_x >= 0 else -1.0)
+
+    if boost_frames_left > 0:
+        boost_frames_left -= 1
+        boost = BOOST_SPEED if boost_dir > 0 else -BOOST_SPEED
+    else:
+        boost = 0.0
+
+    if brake_frames_left > 0:
+        brake_frames_left -= 1
+        brake = True
+    else:
+        brake = False
+
     prev_ball_x, prev_ball_y = ball_x, ball_y
-    ball_x, ball_y, vel_x, vel_y = step_ball(ball_x, ball_y, vel_x, vel_y, tilt)
+    ball_x, ball_y, vel_x, vel_y = step_ball(ball_x, ball_y, vel_x, vel_y, tilt, boost=boost, brake=brake)
     ball_roll_direction, ball_rotation = update_ball_roll(
         ball_roll_direction, ball_rotation, prev_ball_x, prev_ball_y, ball_x, ball_y
     )
 
-    gx, gy = int(ball_x), int(ball_y)
-
-    if 0 <= gx < WIDTH and 0 <= gy < HEIGHT and static_color[idx(gx, gy)] == 3:
+    if ball_touches_color(ball_x, ball_y, 3, min_count=GOAL_WIN_PIXELS):
         won = True
         win_timer = 1.0
     elif (
-        ball_x < -BALL_RADIUS - 2
+        ball_touches_color(ball_x, ball_y, 7)  # spike -- instant death
+        or ball_x < -BALL_RADIUS - 2
         or ball_x > WIDTH + BALL_RADIUS + 2
         or ball_y < -BALL_RADIUS - 2
         or ball_y > HEIGHT + BALL_RADIUS + 2

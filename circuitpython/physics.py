@@ -8,17 +8,23 @@ historically the two were hand-copied and drifted out of sync repeatedly.
 
 Pure logic only: no displayio, no pygame, no hardware. Callers own their
 own rendering and input (potentiometer vs mouse/keyboard) and just read
-the shared grid state (`solid`, `static_color`) to decide what to draw.
+the shared state (`static_color` for the goal/spike/wall-render grid,
+`wall_segments`/`bar_segments` for collision) to decide what to draw.
 
-There's no separate "ramp" cell type -- a wall is a wall. A diagonal or
-staircase-shaped run of wall cells naturally acts like a slope because
-step_ball() derives how much to roll (vs. bounce) a contact from how
-diagonal the local wall surface actually is at collision time, not from
-anything stored per cell.
+Walls are continuous line segments (`wall_segments`), not grid cells --
+collision against them is exact point-segment geometry at any angle, the
+same math spinner bars have always used (see point_segment_distance()).
+There's no separate "ramp" type -- a diagonal wall is just a wall at an
+angle, and step_ball() derives how much to roll (vs. bounce) a contact
+from how diagonal that angle actually is at collision time, not from
+anything stored per wall. Goals and spikes remain on the simpler
+per-pixel `static_color` grid (a plain position check, not a collision
+shape), and are unaffected by any of this.
 
-Import names directly (`from physics import solid, set_cell, ...`) --
-the grid arrays are mutated in place (never reassigned), so a plain
-import stays valid even after clear_level() runs.
+Import names directly (`from physics import static_color, set_cell, ...`)
+-- `static_color` is mutated in place (never reassigned), and
+`wall_segments`/`bar_segments` are cleared-and-refilled in place too, so a
+plain import stays valid even after clear_level()/apply_walls() runs.
 """
 
 import math
@@ -27,6 +33,11 @@ WIDTH = 64
 HEIGHT = 32
 BALL_RADIUS = 2
 BAR_HALF_THICKNESS = 1.0
+# One fixed thickness for every wall (mirrors BAR_HALF_THICKNESS) rather
+# than a per-wall setting -- collision reach is BALL_RADIUS +
+# WALL_HALF_THICKNESS against the wall's exact segment geometry (see
+# _wall_contact()).
+WALL_HALF_THICKNESS = 1.0
 
 MAX_SPEED = 3
 # Each frame, vel_x closes this fraction of the gap to tilt*MAX_SPEED (its
@@ -34,7 +45,7 @@ MAX_SPEED = 3
 # speed proportional to how far it's tilted (like gravity along an incline)
 # instead of most of the tilt range saturating to MAX_SPEED almost
 # immediately. Higher = snappier/twitchier, lower = smoother/more gradual.
-TILT_RESPONSE = 0.2
+TILT_RESPONSE = 0.24
 # Fraction of speed lost per frame once nothing is actively driving it --
 # vel *= (1 - FRICTION), so 0 = no friction (coasts forever) and 1 =
 # instant stop. Bigger number = more friction, like the name suggests.
@@ -46,72 +57,129 @@ FRICTION = 0.05
 # opposing tilt is braking or accelerating -- see step_ball()'s "cradle"
 # handling. Small enough to be imperceptible once treated as reached.
 BRAKE_THRESHOLD = 0.05
+# Speed shed per frame by the dedicated brake button only (see
+# _brake_toward_zero() and step_ball()'s `brake` parameter). A flat
+# amount, not a fraction of current speed like TILT_RESPONSE/FRICTION
+# are -- a fraction-based brake decelerates hardest right when it's
+# fastest and crawls to a stop asymptotically (in the limit, it never
+# quite reaches exactly 0), which reads as snapping to a stop almost
+# instantly rather than slowing down the way an actual car's brakes do:
+# roughly constant deceleration regardless of current speed, arriving
+# at exactly 0 in a fixed, predictable distance.
+BRAKE_DECEL = 0.06
+# Fraction of the opposing-tilt "cradle" catch's speed cut per frame --
+# see the `opposing` case in step_ball(). Deliberately fast (unlike
+# BRAKE_DECEL above): this case also fires every time a wall bounce
+# reverses the ball's velocity against whatever tilt is still
+# commanding, not just on a deliberate tilt reversal, so a slow catch
+# here gives the ball a long runway to re-accelerate into the wall
+# before the next hit -- which doesn't decay the bounce at all, it just
+# wanders indefinitely instead of ever settling against the wall.
+CRADLE_RESPONSE = 0.6
+# Speed step_ball() pins vel_x to, every frame a one-shot boost (see its
+# `boost` parameter) is active -- deliberately above MAX_SPEED, since
+# the whole point is to briefly exceed normal top speed rather than just
+# snap to it early.
+BOOST_SPEED = MAX_SPEED * 1.15
 WALL_DAMPING = -0.1
-# The ball reflects off whatever local surface direction the nearby solid
-# cells actually form (see _corner_normal()) rather than independently
-# negating whichever axis got blocked, which is what let it get stuck
-# reversing in place at a corner instead of deflecting off to the side.
-# There's no separate "ramp" concept -- a diagonal/staircase run of plain
-# wall cells IS a slope: WALL_RESTITUTION is scaled down by how diagonal
-# that local surface normal is (see the diagonal_factor comment in
+# The ball reflects off the wall segment's own exact angle (see
+# _wall_normal()) rather than independently negating whichever axis got
+# blocked, which is what let it get stuck reversing in place at a corner
+# instead of deflecting off to the side. There's no separate "ramp"
+# concept -- a wall at an angle IS a slope: WALL_RESTITUTION is scaled
+# down by how diagonal that angle is (see the diagonal_factor comment in
 # step_ball), from a square-on flat-wall bounce at one extreme to a
-# frictionless roll/slide at the other, with nothing extra to configure
-# per cell. A steep, close-to-45-degree staircase reads as touching a
-# corner almost every frame and rolls smoothly; a shallow one spends most
-# of its time resting on a flat tread between corners and reads more like
-# an actual bumpy staircase -- which is the honest result of this being
-# unit-cell pixel geometry, not a hand-tuned slope value.
-WALL_RESTITUTION = 0.9
-BAR_RESTITUTION = 0.8  # bounciness of the flipper bounce (1.0 = perfectly elastic)
-# Fraction of an into-the-bar impact that gets redirected along the bar's
-# length instead of just bounced straight back, using the bar's current
-# (rotating) angle, so hitting a tilted flipper sends the ball rolling/
-# sliding off along it rather than only ever bouncing off its normal.
-BAR_ROLL = 0.4
+# frictionless roll/slide at the other, continuously at any angle, with
+# nothing extra to configure per wall.
+WALL_RESTITUTION = 0.98
+# Below this incoming speed -- AND only while tilt is actively driving
+# the ball into that same wall (see step_ball()) -- an impact is
+# absorbed instead of bounced. Well under typical gameplay speeds
+# (MAX_SPEED is several times this), so it only ever kicks in once a
+# repeated, tilt-re-driven bounce has already died down this far, not
+# on a normal fast hit. Has to stay above whatever the steady-state
+# tilt-held-against-a-wall bounce amplitude actually settles into --
+# which scales up with WALL_RESTITUTION/TILT_RESPONSE, so a bouncier
+# wall or a stronger tilt both need a correspondingly higher value here
+# or this never catches the cycle at all and it bounces forever instead
+# of ever settling (checked directly: it does settle at this value, for
+# the current WALL_RESTITUTION/TILT_RESPONSE).
+REST_IMPACT_SPEED = 1.8
+# Spinner bars use this exact same diagonal_factor-scaled reflection, not
+# a separate bar-only restitution/roll formula -- see _bar_normal() and
+# step_ball()'s bar-contact handling below.
 
-# ---------- Level grid state (one level's worth of geometry) ----------
-solid = bytearray(WIDTH * HEIGHT)
+# ---------- Level state (one level's worth of geometry) ----------
+# static_color is the render/lookup grid for goals and spikes (plain
+# position checks -- see code.py/level_editor.py's win/spike checks) and
+# also where wall segments get rasterized to for DISPLAY only (see
+# apply_walls() below); it is never consulted for wall collision.
 static_color = bytearray(WIDTH * HEIGHT)
 bar_segments = []  # current spinner bars as (x0, y0, x1, y1) tuples
+wall_segments = []  # current level's walls as (x0, y0, x1, y1) tuples
 
 
 def idx(x, y):
     return y * WIDTH + x
 
 
-def set_cell(x, y, wall=False, goal=False):
+def set_cell(x, y, goal=False, spike=False):
     i = idx(x, y)
-    if wall:
-        solid[i] = 1
-        static_color[i] = 2
-    elif goal:
-        solid[i] = 0
+    if goal:
         static_color[i] = 3
+    elif spike:
+        # A spike doesn't block movement like a wall does, it's a hazard
+        # the ball passes over. Touching it is a plain position check
+        # against static_color, same as the goal check, done by the
+        # caller (code.py / level_editor.py) rather than anything in
+        # step_ball().
+        static_color[i] = 7
 
 
 def clear_cell(x, y):
-    i = idx(x, y)
-    solid[i] = 0
-    static_color[i] = 0
+    static_color[idx(x, y)] = 0
 
 
 def clear_level():
     for i in range(WIDTH * HEIGHT):
-        solid[i] = 0
         static_color[i] = 0
+    wall_segments.clear()
 
 
 def apply_walls(walls):
-    """Paint a level's wall cells (levels_data's "walls" list, entries of
-    (x0, x1, y)) into the grid. There's no separate ramp type -- a
-    diagonal run of wall cells (see add_wall_line() below) is just more
-    wall, and reduces to ordinary per-row spans same as any other wall
-    shape. Caller is responsible for clear_level() first and for
-    anything else the level format carries (goals, spinners, start
-    position)."""
-    for x0, x1, y in walls:
-        for x in range(x0, x1 + 1):
-            set_cell(x, y, wall=True)
+    """Build wall_segments (for collision) from a level's "walls" list --
+    each entry a polyline: a list of >=1 [x, y] points, consecutive pairs
+    becoming one segment each (a 1-point polyline becomes a single
+    zero-length segment, i.e. a point obstacle). Also rasterizes every
+    resulting segment into static_color for rendering only -- collision
+    against a wall is always exact point-segment geometry (see
+    step_ball()), never this grid. There's no separate ramp type -- a
+    diagonal wall is just a wall at an angle; step_ball() derives how
+    much to roll (vs. bounce) a contact from how diagonal the segment
+    actually is at collision time, not from anything stored per wall.
+    Caller is responsible for clear_level() first and for anything else
+    the level format carries (goals, spikes, spinners, start position).
+
+    Safe to call again later with an updated `walls` (e.g. the desktop
+    editor, after one wall is added/erased) without a clear_level() in
+    between -- clears this function's OWN previously-painted wall(2)
+    pixels first, so a removed wall's old static_color pixels never
+    linger as a stale rendering after it's gone. Goal/spike pixels are
+    untouched either way, since those are never color 2."""
+    for i in range(WIDTH * HEIGHT):
+        if static_color[i] == 2:
+            static_color[i] = 0
+    wall_segments.clear()
+    for points in walls:
+        if len(points) == 1:
+            x0, y0 = points[0]
+            wall_segments.append((x0, y0, x0, y0))
+        else:
+            for (x0, y0), (x1, y1) in zip(points, points[1:]):
+                wall_segments.append((x0, y0, x1, y1))
+    for seg in wall_segments:
+        for x, y in segment_pixels_for_draw(seg):
+            static_color[idx(x, y)] = 2
 
 
 def apply_goals(goals):
@@ -122,70 +190,21 @@ def apply_goals(goals):
             set_cell(x, y, goal=True)
 
 
-def wall_line_cells(x0, y0, x1, y1, thickness=1):
-    """The grid cells a straight line between two endpoints would cover,
-    thickness pixels wide, WITHOUT painting them -- the actual line math,
-    shared by add_wall_line() (which paints the result) and the level
-    editor's live preview of what a second click would place."""
-    if x0 > x1:
-        x0, x1 = x1, x0
-        y0, y1 = y1, y0
-    dx = x1 - x0
-    dy = y1 - y0
-    cells = []
-    if dx == 0:
-        for dyi in range(thickness):
-            y = y0 + dyi
-            if 0 <= y < HEIGHT:
-                cells.append((x0, y))
-        return cells
-
-    if abs(dy) <= abs(dx):
-        # Shallow-ish: step along x, banding a vertical thickness-band per
-        # column -- consecutive columns' bands always overlap here since
-        # the y-step per column is at most 1.
+def apply_spikes(spikes):
+    """Paint a level's spike cells (levels_data's "spikes" list, entries
+    of (x0, x1, y)) into the grid -- a hazard that instantly kills the
+    ball on contact (checked by the caller, same as the goal check)."""
+    for x0, x1, y in spikes:
         for x in range(x0, x1 + 1):
-            t = (x - x0) / dx
-            line_y = int(round(y0 + t * dy))
-            for dyi in range(thickness):
-                y = line_y + dyi
-                if 0 <= y < HEIGHT:
-                    cells.append((x, y))
-    else:
-        # Steep: stepping along x would skip rows faster than `thickness`
-        # can bridge, leaving gaps -- step along y instead (like a proper
-        # line-drawing algorithm choosing the larger-delta axis) so
-        # consecutive rows' horizontal bands always overlap instead.
-        ylo, yhi = (y0, y1) if y1 >= y0 else (y1, y0)
-        for y in range(ylo, yhi + 1):
-            t = (y - y0) / dy
-            line_x = int(round(x0 + t * dx))
-            for dxi in range(thickness):
-                x = line_x + dxi
-                if 0 <= x < WIDTH:
-                    cells.append((x, y))
-    return cells
+            set_cell(x, y, spike=True)
 
 
-def add_wall_line(x0, y0, x1, y1, thickness=1):
-    """Rasterize a straight line of wall cells between two endpoints,
-    thickness pixels wide -- the level editor's click-two-points tool for
-    building a clean diagonal/staircase wall run without having to
-    freehand-drag every pixel. Purely a convenience for painting the
-    grid: the result is indistinguishable from any other wall cell (no
-    stored slope/direction) -- step_ball() derives "this is a slope"
-    from the shape of whatever solid cells happen to be there at
-    collision time, not from how they got painted."""
-    for x, y in wall_line_cells(x0, y0, x1, y1, thickness):
-        set_cell(x, y, wall=True)
-
-
-# The ball's actual collision/rendering reach, squared -- BALL_RADIUS+1
-# rather than BALL_RADIUS itself so the rounded shape below isn't a
-# perfect (smaller) diamond/square. _touching_cells() uses this exact
-# same threshold: collision and rendering must agree on how far the ball
-# reaches, or the ball's drawn edge can visibly sit on top of a wall
-# cell before physics agrees it's touching anything (or vice versa).
+# The ball's rendered shape's reach, squared -- BALL_RADIUS+1 rather than
+# BALL_RADIUS itself so the rounded shape below isn't a perfect (smaller)
+# diamond/square. Purely a rendering concern now -- wall/bar collision
+# reach is BALL_RADIUS + WALL_HALF_THICKNESS/BAR_HALF_THICKNESS against
+# exact segment geometry (see _nearest_segment_contact()), independent of
+# this.
 BALL_REACH_SQ = BALL_RADIUS * BALL_RADIUS + 1
 
 BALL_OFFSETS = []
@@ -206,6 +225,43 @@ def ball_pixels_at(cx, cy):
         if 0 <= x < WIDTH and 0 <= y < HEIGHT:
             pts.append((x, y))
     return pts
+
+
+def ball_touches_color(cx, cy, color, min_count=1):
+    """True if at least min_count pixels of the ball's sprite at (cx, cy)
+    -- its full rendered footprint (see ball_pixels_at()), not just its
+    center cell -- have the given static_color code. Used for goal/spike
+    contact so a touch registers off actual overlapping pixels, matching
+    how the ball visually touches a goal/spike, rather than off just its
+    center. This also closes a tunneling gap: a goal/spike is often only
+    one row thick, and checking just the ball's center pixel could skip
+    clean over it in a single fast frame, but the ball's footprint
+    (BALL_RADIUS=2, so ~5 pixels wide) is wider than any one frame's max
+    movement (MAX_SPEED/BOOST_SPEED, both well under 4), so consecutive
+    frames' footprints always overlap and can't both miss a row in
+    between -- true regardless of min_count, since it only raises how
+    much of that overlap has to land on the target color, not whether
+    there's overlap at all.
+
+    min_count > 1 (see GOAL_WIN_PIXELS) requires more than a single
+    pixel's worth of overlap -- e.g. for the goal, so reaching it reads
+    as the ball actually settling onto it, not just grazing its edge
+    pixel while still mostly on the approach."""
+    count = 0
+    for x, y in ball_pixels_at(cx, cy):
+        if static_color[idx(x, y)] == color:
+            count += 1
+            if count >= min_count:
+                return True
+    return False
+
+
+# How many of the ball's own pixels have to land on a goal pixel before
+# the level counts as won -- 1 (any single overlapping pixel) read as
+# winning before the ball looked like it had really reached the goal,
+# since the ball's footprint is round and its outermost pixels are only
+# a thin sliver of it. Tune directly if this still feels early/late.
+GOAL_WIN_PIXELS = 3
 
 
 def update_ball_roll(direction, rotation, prev_x, prev_y, cx, cy):
@@ -246,21 +302,16 @@ def update_ball_roll(direction, rotation, prev_x, prev_y, cx, cy):
 
 
 # Cell size (in pixels) of the checker grid painted on the ball's
-# surface. A first attempt used 2px cells (crisp, clearly checkered,
-# lots of squares visible), sliding the grid's origin smoothly with
-# distance rolled -- but at that cell size, a 1px slide flips up to
-# ~11 of the ball's ~21 pixels at once, since the whole grid moves in
-# lockstep and there are enough 2px-spaced boundaries crossing the
-# ball's small silhouette for several to shift together. A rotating
-# angle-sector "pinwheel" (each pixel's own angle decides its wedge,
-# independent of the others) fixed the smoothness but no longer reads
-# as a checkerboard. 4px cells were smoother (~6 pixels/step) but
-# visibly coarser -- fewer, bigger squares. 3px lands closer to the
-# original look (more, smaller squares) while still cutting the worst-
-# case jump from 2px's ~11 down to ~8 (checked directly in headless
-# testing, not just assumed): the middle ground between "as checkered
-# as possible" and "as smooth as possible".
-BALL_CHECKER_SIZE = 3
+# surface, sliding smoothly with distance rolled. Smaller cells mean
+# more, smaller squares (more checkered) but a bigger worst-case jump
+# per 1px slide, since the whole grid moves in lockstep and more
+# 2px-spaced boundaries cross the ball's small (~21px) silhouette at
+# once: measured directly in headless testing, 4px cells top out at
+# ~6 pixels changing in a single step, 3px at ~8, and 2px at ~11. A
+# rotating angle-sector "pinwheel" (each pixel's own angle decides its
+# wedge, independent of the others) stays smooth at any density but no
+# longer reads as a checkerboard.
+BALL_CHECKER_SIZE = 2
 
 
 def ball_accent_pixels_at(cx, cy, direction, rotation):
@@ -340,10 +391,35 @@ def bresenham_line(x0, y0, x1, y1):
     return points
 
 
-def bar_pixels_for_draw(seg):
+def _round_half_up(v):
+    """int(v) rounded to the nearest integer, ties always resolved up --
+    unlike the builtin round(), which uses banker's rounding (round half
+    to EVEN): round(0.5)==0 but round(1.5)==2, round(2.5)==2 but
+    round(3.5)==4, etc. A hand-drawn wall's endpoint lands on an exact
+    .5 maze coordinate often (the level editor's mouse position is
+    divided by its SCALE, an even number, so any screen position that's
+    a multiple of SCALE/2 does) -- with round(), whether that endpoint's
+    rendered pixel is nudged up or down then depends on the unrelated
+    parity of its integer part, reading as the same-looking wall
+    rendering a pixel off from where it was actually drawn/clicked,
+    seemingly at random. This is also exactly why the levels_data.json
+    wall-format migration needed a tiny epsilon nudge to render
+    correctly -- same underlying ambiguity, worked around there instead
+    of fixed here, before this function existed in its current form."""
+    return math.floor(v + 0.5)
+
+
+def segment_pixels_for_draw(seg):
+    """The on-screen pixels for one (x0, y0, x1, y1) segment's centerline
+    -- used to render both spinner bars and walls, which share this exact
+    rasterization. Collision is never based on this: it's always exact
+    point-segment geometry against the continuous segment coordinates
+    (see _wall_contact()/_bar_contact())."""
     x0, y0, x1, y1 = seg
     pts = set()
-    for x, y in bresenham_line(int(round(x0)), int(round(y0)), int(round(x1)), int(round(y1))):
+    x0i, y0i = int(_round_half_up(x0)), int(_round_half_up(y0))
+    x1i, y1i = int(_round_half_up(x1)), int(_round_half_up(y1))
+    for x, y in bresenham_line(x0i, y0i, x1i, y1i):
         if 0 <= x < WIDTH and 0 <= y < HEIGHT:
             pts.add((x, y))
     return pts
@@ -362,81 +438,17 @@ def update_bar_segments(spinners):
         bar_segments.append((x0, y0, x1, y1))
 
 
-def _touching_cells(cx, cy):
-    """Yield (x, y, ddx, ddy, dist) for every solid grid cell whose unit
-    square actually overlaps a circle of BALL_REACH_SQ centered at the
-    continuous point (cx, cy) -- ddx/ddy/dist describe the vector from the
-    nearest point on that cell back to (cx, cy). Uses the exact same
-    reach as BALL_OFFSETS (the ball's rendered shape), not just
-    BALL_RADIUS itself -- collision must match what's drawn, or the
-    ball's edge can visibly sit on top of a wall cell (or vice versa)
-    before physics agrees it's touching anything.
-
-    This is a real geometric circle-vs-square test, NOT the ball's
-    discretized rendering shape (BALL_OFFSETS, used by ball_pixels_at for
-    the on-screen sprite) checked at a truncated int(cx), int(cy). That
-    used to be how collision detection worked here too, but BALL_OFFSETS
-    deliberately excludes the (+-BALL_RADIUS, +-BALL_RADIUS) corners to
-    look round -- which means it has real blind spots at exactly those
-    corners: a wall corner sitting in that gap went completely
-    undetected until the ball's sub-pixel position drifted enough to
-    bring it into a checked cell, at which point it would suddenly catch.
-    A true per-cell distance test has no such gap."""
-    px, py = int(cx), int(cy)
-    search = BALL_RADIUS + 1
-    for y in range(py - search, py + search + 1):
-        if y < 0 or y >= HEIGHT:
-            continue
-        for x in range(px - search, px + search + 1):
-            if x < 0 or x >= WIDTH:
-                continue
-            if not solid[idx(x, y)]:
-                continue
-            nearest_x = max(x, min(cx, x + 1))
-            nearest_y = max(y, min(cy, y + 1))
-            ddx = cx - nearest_x
-            ddy = cy - nearest_y
-            dist_sq = ddx * ddx + ddy * ddy
-            if dist_sq <= BALL_REACH_SQ:
-                yield x, y, ddx, ddy, math.sqrt(dist_sq)
-
-
-def circle_blocked(cx, cy):
-    """Returns (blocked, is_bar). is_bar is True when what's blocking is a
-    spinner bar rather than the solid grid -- resolve_bar_bounce() already
-    computed the correct reflection for that case, so step_ball() just
-    needs to know not to also run wall-corner reflection on top of it."""
-    best_d = None
-    for seg in bar_segments:
+def _nearest_segment_contact(cx, cy, segments, contact_dist):
+    """(d, nx, ny) for the nearest segment in `segments` within
+    contact_dist of (cx, cy) -- d is the distance to its surface, (nx, ny)
+    the unit normal pointing from that surface toward (cx, cy) -- or None
+    if nothing in `segments` is within range. Shared by bars and walls:
+    both are just "segments with a half-thickness" as far as collision is
+    concerned (see _bar_contact()/_wall_contact())."""
+    best = None
+    for seg in segments:
         d = point_segment_distance(cx, cy, seg[0], seg[1], seg[2], seg[3])
-        if best_d is None or d < best_d:
-            best_d = d
-    if best_d is not None and best_d < BALL_RADIUS + BAR_HALF_THICKNESS:
-        return True, True
-    for _x, _y, _ddx, _ddy, _dist in _touching_cells(cx, cy):
-        return True, False
-    return False, False
-
-
-def _wall_blocked(cx, cy):
-    """Like circle_blocked, but only the solid-grid (wall) check -- no
-    bar-proximity check. Used to keep the bar-bounce position correction
-    below from ever shoving the ball into a wall: the normal per-frame
-    collision code only checks whether the *next* step is blocked, so
-    once a push embeds the ball's center inside solid cells, nothing
-    would ever move it back out again."""
-    for _ in _touching_cells(cx, cy):
-        return True
-    return False
-
-
-def resolve_bar_bounce(ball_x, ball_y, vel_x, vel_y):
-    """Apply spinner-bar bounce physics against the current bar_segments.
-    Returns the updated (ball_x, ball_y, vel_x, vel_y)."""
-    for seg in bar_segments:
-        d = point_segment_distance(ball_x, ball_y, seg[0], seg[1], seg[2], seg[3])
-        contact_dist = BALL_RADIUS + BAR_HALF_THICKNESS
-        if d < contact_dist:
+        if d < contact_dist and (best is None or d < best[0]):
             x0, y0, x1, y1 = seg
             dxs = x1 - x0
             dys = y1 - y0
@@ -444,129 +456,221 @@ def resolve_bar_bounce(ball_x, ball_y, vel_x, vel_y):
             if length_sq == 0:
                 t = 0.0
             else:
-                t = ((ball_x - x0) * dxs + (ball_y - y0) * dys) / length_sq
-                t = max(0.0, min(1.0, t))
+                t = max(0.0, min(1.0, ((cx - x0) * dxs + (cy - y0) * dys) / length_sq))
             closest_x = x0 + t * dxs
             closest_y = y0 + t * dys
-            seg_len = math.sqrt(length_sq) if length_sq > 0 else 1.0
             if d > 0.0001:
-                nx = (ball_x - closest_x) / d
-                ny = (ball_y - closest_y) / d
+                nx = (cx - closest_x) / d
+                ny = (cy - closest_y) / d
             else:
+                seg_len = math.sqrt(length_sq) if length_sq > 0 else 1.0
                 nx = -dys / seg_len
                 ny = dxs / seg_len
-            # Tangent direction along the bar's current length, for the
-            # roll effect below.
-            tx = dxs / seg_len
-            ty = dys / seg_len
-            # Reflect velocity across the contact normal (only if actually
-            # moving into the bar) -- this is what makes the bounce
-            # direction depend on the bar's current angle, not just which
-            # axis got blocked.
-            dot_n = vel_x * nx + vel_y * ny
-            if dot_n < 0:
-                vel_x -= (1 + BAR_RESTITUTION) * dot_n * nx
-                vel_y -= (1 + BAR_RESTITUTION) * dot_n * ny
-                # Also roll some of that impact along the bar's length,
-                # continuing whichever way the ball was already drifting
-                # tangentially, so hitting a tilted flipper sends it
-                # sliding off along the slope instead of only ever
-                # bouncing straight back off it.
-                dot_t = vel_x * tx + vel_y * ty
-                roll_sign = 1.0 if dot_t >= 0 else -1.0
-                vel_x += BAR_ROLL * -dot_n * roll_sign * tx
-                vel_y += BAR_ROLL * -dot_n * roll_sign * ty
-            overlap = contact_dist - d
-            if overlap > 0:
-                pushed_x = ball_x + nx * overlap
-                pushed_y = ball_y + ny * overlap
-                if not _wall_blocked(pushed_x, pushed_y):
-                    ball_x = pushed_x
-                    ball_y = pushed_y
-                # else: leave the position alone -- pushing here would bury
-                # the ball in a wall. The velocity reflection above still
-                # applies, and the normal wall-collision code in step_ball
-                # takes over from here to keep the ball out of the wall.
-    return ball_x, ball_y, vel_x, vel_y
+            best = (d, nx, ny)
+    return best
 
 
-def _corner_normal(cx, cy):
-    """Approximate the direction pointing away from nearby solid cells,
-    for resolving contacts where axis-separated collision alone would
-    give the wrong answer -- a flat wall face reduces to a single clean
-    axis-aligned normal here (matching the old per-axis behavior exactly),
-    but a corner or a diagonal/staircase run of wall cells doesn't have
-    one obvious "which axis" to bounce off; independently negating
-    whichever axis got blocked would bounce a corner hit straight back
-    the way the ball came instead of deflecting it to the side (or, for
-    a diagonal run, would never let it roll along the slope at all).
-    This uses the same true circle-vs-cell test as circle_blocked
-    (_touching_cells) and averages the away-from-ball directions of
-    every touching cell into one usable normal -- how far that normal
-    leans off-axis is also what step_ball() uses to decide how much
-    "roll" (vs. plain bounce) a given contact gets; see the
-    diagonal_factor comment there. Returns a (nx, ny) unit vector, or
-    None if nothing solid is touching (shouldn't normally happen right
-    after both axes were just found blocked using this same test, but
-    the position may have shifted slightly) or if the touching cells'
-    directions cancel out (the ball pinched between two opposing
-    surfaces, with no single well-defined escape direction)."""
-    sum_x = 0.0
-    sum_y = 0.0
-    for _x, _y, ddx, ddy, dist in _touching_cells(cx, cy):
-        if dist > 0.0001:
-            sum_x += ddx / dist
-            sum_y += ddy / dist
-    length = math.sqrt(sum_x * sum_x + sum_y * sum_y)
-    if length < 0.0001:
-        return None
-    return sum_x / length, sum_y / length
+def _bar_contact(cx, cy):
+    """_nearest_segment_contact() against the current spinner bars. Bars
+    move (they rotate continuously), so unlike a wall this same geometry
+    also has to be checked against the ball's CURRENT, already-settled
+    position every frame (see step_ball), not just against where the ball
+    is trying to move next -- since the bar itself can sweep into a spot
+    the ball was already resting in."""
+    return _nearest_segment_contact(cx, cy, bar_segments, BALL_RADIUS + BAR_HALF_THICKNESS)
 
 
-def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
-    """Advance the ball one physics tick: spinner-bar bounce, tilt-driven
-    acceleration, and wall collision with a geometry-derived roll/bounce.
-    Returns the updated (ball_x, ball_y, vel_x, vel_y) -- callers handle
-    their own win/out-of-bounds checks and rendering using the result."""
-    ball_x, ball_y, vel_x, vel_y = resolve_bar_bounce(ball_x, ball_y, vel_x, vel_y)
+def _bar_normal(cx, cy):
+    """(nx, ny) from _bar_contact(cx, cy), or None."""
+    contact = _bar_contact(cx, cy)
+    return (contact[1], contact[2]) if contact else None
 
-    if tilt != 0:
-        target_vel_x = tilt * MAX_SPEED
-        # Tilting the SAME way the ball is already (meaningfully) moving,
-        # or from a near-standstill, springs vel_x toward the target as
-        # usual -- tilt commands a target speed (proportional to how far
-        # it's tilted, like gravity along an incline -- see
-        # TILT_RESPONSE's comment). But tilting AGAINST existing motion
-        # (trying to stop or reverse it) used to spring straight toward
-        # the full opposite target just as fast, which blew through zero
-        # in about 3 frames at full speed/full opposite tilt -- reading
-        # as "the ball instantly starts rolling the other way" instead of
-        # ever actually catching it. Braking toward 0 specifically (not
-        # the opposite target) while still meaningfully moving gives a
-        # real, gradual "cradle" window: release tilt during it and the
-        # ball just continues slowing to a stop like normal, instead of
-        # rocketing past zero into reverse. Once speed decays under
-        # BRAKE_THRESHOLD it counts as "at rest", and the normal spring
-        # above takes over, accelerating into the new direction from a
-        # standing start -- same as if that tilt had been applied fresh.
-        opposing = (
-            (vel_x > BRAKE_THRESHOLD and target_vel_x < 0)
-            or (vel_x < -BRAKE_THRESHOLD and target_vel_x > 0)
-        )
-        if opposing:
-            vel_x += (0 - vel_x) * TILT_RESPONSE
-        else:
-            vel_x += (target_vel_x - vel_x) * TILT_RESPONSE
+
+def _wall_contact(cx, cy):
+    """_nearest_segment_contact() against the current level's walls.
+    Unlike bars, walls are static, so (unlike _bar_contact) this is only
+    ever queried reactively -- against where the ball is trying to move
+    next, inside step_ball()'s circle_blocked()/_contact_normal() calls --
+    never against the ball's current, already-valid resting position,
+    since a static wall can never sweep into a spot on its own."""
+    return _nearest_segment_contact(cx, cy, wall_segments, BALL_RADIUS + WALL_HALF_THICKNESS)
+
+
+def _wall_normal(cx, cy):
+    """(nx, ny) from _wall_contact(cx, cy), or None."""
+    contact = _wall_contact(cx, cy)
+    return (contact[1], contact[2]) if contact else None
+
+
+def circle_blocked(cx, cy):
+    """True if a circle at (cx, cy) touches a spinner bar or a wall --
+    step_ball() treats both the same way (see _contact_normal()), so
+    callers don't need to know which kind."""
+    return _bar_normal(cx, cy) is not None or _wall_normal(cx, cy) is not None
+
+
+# How far apart consecutive points checked along a movement step (see
+# _swept_blocked()) are allowed to be -- comfortably less than the
+# smallest collision margin (BALL_RADIUS + whichever of
+# BAR_HALF_THICKNESS/WALL_HALF_THICKNESS is smaller) so two consecutive
+# checks can never straddle something solid without either one landing
+# inside it.
+SWEEP_STEP = 1.5
+
+
+def _swept_blocked(x0, y0, x1, y1):
+    """True if the straight path from (x0, y0) to (x1, y1) is blocked at
+    ANY point along it, not just at the destination (x1, y1) --
+    checking only the destination lets a fast enough single-frame move
+    (see BOOST_SPEED, which can exceed the collision margin) land clean
+    on the far side of a thin wall or bar without either endpoint ever
+    registering as blocked, tunneling straight through whatever was in
+    between. Subdivides the path into steps no longer than SWEEP_STEP."""
+    dx = x1 - x0
+    dy = y1 - y0
+    dist = math.sqrt(dx * dx + dy * dy)
+    if dist <= SWEEP_STEP:
+        return circle_blocked(x1, y1)
+    steps = int(math.ceil(dist / SWEEP_STEP))
+    for i in range(1, steps + 1):
+        t = i / steps
+        if circle_blocked(x0 + dx * t, y0 + dy * t):
+            return True
+    return False
+
+
+def _wall_blocked(cx, cy):
+    """Like circle_blocked, but walls only -- no bar-proximity check.
+    Used to keep the bar-contact position correction in step_ball() from
+    ever shoving the ball into a wall: the normal per-frame collision
+    code only checks whether the *next* step is blocked, so once a push
+    embeds the ball's center inside a wall, nothing would ever move it
+    back out again."""
+    return _wall_normal(cx, cy) is not None
+
+
+def _contact_normal(cx, cy):
+    """_bar_normal() if a bar is within reach of (cx, cy), else
+    _wall_normal() -- the single normal step_ball()'s collision response
+    reflects/rolls against, so a spinner bar gets exactly the same
+    diagonal-aware bounce-vs-roll treatment a wall does, including at a
+    steep angle that would otherwise read as a flat-on hit."""
+    normal = _bar_normal(cx, cy)
+    if normal is not None:
+        return normal
+    return _wall_normal(cx, cy)
+
+
+def _brake_toward_zero(v):
+    """v decelerated toward 0 by a flat BRAKE_DECEL, clamped at exactly 0
+    rather than overshooting past it into the opposite sign."""
+    if v > 0:
+        return max(0.0, v - BRAKE_DECEL)
+    if v < 0:
+        return min(0.0, v + BRAKE_DECEL)
+    return v
+
+
+def step_ball(ball_x, ball_y, vel_x, vel_y, tilt, boost=0.0, brake=False):
+    """Advance the ball one physics tick: tilt-driven acceleration, then
+    collision with a geometry-derived roll/bounce against both the
+    current level's walls and the current spinner bars. Returns the
+    updated (ball_x, ball_y, vel_x, vel_y) -- callers handle their own
+    win/out-of-bounds checks and rendering using the result.
+
+    boost and brake are one-shot, caller-owned power-ups (see code.py's
+    BOOST_*/BRAKE_* handling) -- physics.py has no notion of "remaining"
+    or duration for either; the caller re-passes a truthy value every
+    frame its effect should still be running (typically a fixed number
+    of frames), and False/0.0 (the defaults) disable them entirely, each
+    frame behaving exactly as if the parameter didn't exist.
+
+    boost pins vel_x to its (signed) value for this frame instead of
+    letting tilt/friction set it normally, with the usual +-MAX_SPEED
+    clamp widened to match. brake overrides tilt entirely for this frame
+    -- both axes decelerate toward 0 via _brake_toward_zero() regardless
+    of what tilt is doing, rather than the one-frame "set velocity to 0"
+    this used to be, which barely read as braking at all whenever tilt
+    was still held: it got zeroed for exactly one frame and then started
+    accelerating right back up the very next one, same as if nothing
+    had happened."""
+    # Bars move on their own (continuous rotation), unlike walls -- so a
+    # bar can sweep into the ball's current, already-settled position
+    # even with the ball not moving at all, which the position-advance
+    # check below can't catch (it only reacts to the ball's own
+    # attempted next step). Handle that intrusion here first, with the
+    # same geometry-driven reflect used for everything else below.
+    bar_contact = _bar_contact(ball_x, ball_y)
+    if bar_contact is not None:
+        d, nx, ny = bar_contact
+        dot = vel_x * nx + vel_y * ny
+        if dot < 0:
+            diagonal_factor = 2 * abs(nx * ny)
+            restitution = WALL_RESTITUTION * (1 - diagonal_factor)
+            vel_x -= (1 + restitution) * dot * nx
+            vel_y -= (1 + restitution) * dot * ny
+        overlap = (BALL_RADIUS + BAR_HALF_THICKNESS) - d
+        if overlap > 0:
+            pushed_x = ball_x + nx * overlap
+            pushed_y = ball_y + ny * overlap
+            if not _wall_blocked(pushed_x, pushed_y):
+                ball_x, ball_y = pushed_x, pushed_y
+            # else: leave position alone -- pushing here would bury the
+            # ball in a wall. The velocity reflection above still
+            # applies, and the wall-collision pass below keeps it out
+            # of the wall from here.
+
+    if boost != 0:
+        vel_x = boost
+
+    if brake:
+        # Ignores tilt completely for as long as the caller keeps this
+        # True -- both axes decelerate toward 0 at BRAKE_DECEL's flat,
+        # car-like rate, instead of only ever fighting whatever tilt is
+        # currently commanding. Deliberately NOT the same mechanism the
+        # opposing-tilt "cradle" case below uses (CRADLE_RESPONSE) --
+        # see its comment for why that one has to stay fast.
+        vel_x = _brake_toward_zero(vel_x)
+        vel_y = _brake_toward_zero(vel_y)
     else:
-        # Level: nothing is commanding a target speed anymore, so instead
-        # of springing straight to 0 (which used to happen even with
-        # FRICTION maxed out, since the spring above doesn't care what
-        # FRICTION is set to -- tilt=0 just makes ITS OWN target 0 and
-        # brakes for it), the ball coasts on its existing momentum and
-        # only slows via FRICTION, same as vel_y always has.
-        vel_x *= (1 - FRICTION)
-    vel_y *= (1 - FRICTION)
-    vel_x = max(-MAX_SPEED, min(MAX_SPEED, vel_x))
+        if tilt != 0:
+            target_vel_x = tilt * MAX_SPEED
+            # Tilting the SAME way the ball is already (meaningfully) moving,
+            # or from a near-standstill, springs vel_x toward the target as
+            # usual -- tilt commands a target speed (proportional to how far
+            # it's tilted, like gravity along an incline -- see
+            # TILT_RESPONSE's comment). But tilting AGAINST existing motion
+            # (trying to stop or reverse it) used to spring straight toward
+            # the full opposite target just as fast, which blew through zero
+            # in about 3 frames at full speed/full opposite tilt -- reading
+            # as "the ball instantly starts rolling the other way" instead of
+            # ever actually catching it. Braking toward 0 specifically (not
+            # the opposite target) while still meaningfully moving gives a
+            # real, gradual "cradle" window: release tilt during it and the
+            # ball just continues slowing to a stop like normal, instead of
+            # rocketing past zero into reverse. Once speed decays under
+            # BRAKE_THRESHOLD it counts as "at rest", and the normal spring
+            # above takes over, accelerating into the new direction from a
+            # standing start -- same as if that tilt had been applied fresh.
+            opposing = (
+                (vel_x > BRAKE_THRESHOLD and target_vel_x < 0)
+                or (vel_x < -BRAKE_THRESHOLD and target_vel_x > 0)
+            )
+            if opposing:
+                vel_x += (0 - vel_x) * CRADLE_RESPONSE
+            else:
+                vel_x += (target_vel_x - vel_x) * TILT_RESPONSE
+        else:
+            # Level: nothing is commanding a target speed anymore, so instead
+            # of springing straight to 0 (which used to happen even with
+            # FRICTION maxed out, since the spring above doesn't care what
+            # FRICTION is set to -- tilt=0 just makes ITS OWN target 0 and
+            # brakes for it), the ball coasts on its existing momentum and
+            # only slows via FRICTION, same as vel_y always has.
+            vel_x *= (1 - FRICTION)
+        vel_y *= (1 - FRICTION)
+    speed_cap = max(MAX_SPEED, abs(boost))
+    vel_x = max(-speed_cap, min(speed_cap, vel_x))
     vel_y = max(-MAX_SPEED, min(MAX_SPEED, vel_y))
 
     x_stuck = False
@@ -574,18 +678,14 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
     incoming_vel_x, incoming_vel_y = vel_x, vel_y
 
     new_x = ball_x + vel_x
-    blocked, is_bar = circle_blocked(new_x, ball_y)
-    if blocked:
-        if not is_bar:  # a bar's reflection was already applied above
-            x_stuck = True
+    if _swept_blocked(ball_x, ball_y, new_x, ball_y):
+        x_stuck = True
     else:
         ball_x = new_x
 
     new_y = ball_y + vel_y
-    blocked, is_bar = circle_blocked(ball_x, new_y)
-    if blocked:
-        if not is_bar:
-            y_stuck = True
+    if _swept_blocked(ball_x, ball_y, ball_x, new_y):
+        y_stuck = True
     else:
         ball_y = new_y
 
@@ -611,7 +711,7 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
         # through to the pinch fallback below instead of ever reflecting.
         test_x = new_x if x_stuck else ball_x
         test_y = new_y if y_stuck else ball_y
-        normal = _corner_normal(test_x, test_y)
+        normal = _contact_normal(test_x, test_y)
         if normal is not None:
             nx, ny = normal
             dot = incoming_vel_x * nx + incoming_vel_y * ny
@@ -632,7 +732,33 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
                 # surface, i.e. rolling, with no extra ramp-specific code
                 # needed to get there.
                 diagonal_factor = 2 * abs(nx * ny)
-                restitution = WALL_RESTITUTION * (1 - diagonal_factor)
+                # A genuinely fast impact always bounces at the usual
+                # WALL_RESTITUTION -- that's the "bounciness" a wall is
+                # supposed to have, whether or not tilt happens to be
+                # pushing that way too. Below REST_IMPACT_SPEED, it
+                # absorbs instead, but ONLY if tilt is ALSO actively
+                # driving the ball into this same surface right now
+                # (tilt only ever drives vel_x, so this just compares
+                # tilt's sign against the normal's x-component -- tilt
+                # and nx pushing opposite ways means tilt is pushing
+                # further INTO the surface, since nx points away from
+                # it, toward the ball): that combination -- repeatedly
+                # re-driven back into a wall by a steady held tilt, at a
+                # re-approach speed that's already slowed down close to
+                # resting -- is specifically what turned into endless
+                # tiny jitter that never actually settled. A slow hit
+                # that ISN'T currently being re-driven that way (no
+                # tilt, or tilt pointing elsewhere) has no repeated
+                # re-driving force behind it, so it was never going to
+                # jitter in the first place -- it still bounces (gently,
+                # since it's already slow) and then friction alone
+                # settles it, same as always.
+                pushed_into_wall = tilt != 0 and tilt * nx < 0
+                if abs(dot) < REST_IMPACT_SPEED and pushed_into_wall:
+                    base_restitution = 0.0
+                else:
+                    base_restitution = WALL_RESTITUTION
+                restitution = base_restitution * (1 - diagonal_factor)
                 vel_x = incoming_vel_x - (1 + restitution) * dot * nx
                 vel_y = incoming_vel_y - (1 + restitution) * dot * ny
             else:
@@ -667,7 +793,7 @@ def step_ball(ball_x, ball_y, vel_x, vel_y, tilt):
         # clear the whole cluster in one bound.
         step_x, step_y = vel_x, vel_y
         for _ in range(8):
-            if not circle_blocked(ball_x + step_x, ball_y + step_y)[0]:
+            if not _swept_blocked(ball_x, ball_y, ball_x + step_x, ball_y + step_y):
                 ball_x += step_x
                 ball_y += step_y
                 break
