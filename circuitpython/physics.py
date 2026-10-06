@@ -32,12 +32,33 @@ import math
 WIDTH = 64
 HEIGHT = 32
 BALL_RADIUS = 2
-BAR_HALF_THICKNESS = 1.0
-# One fixed thickness for every wall (mirrors BAR_HALF_THICKNESS) rather
-# than a per-wall setting -- collision reach is BALL_RADIUS +
-# WALL_HALF_THICKNESS against the wall's exact segment geometry (see
-# _wall_contact()).
-WALL_HALF_THICKNESS = 1.0
+BAR_HALF_THICKNESS = 1.4
+# A COLLISION-ONLY half-thickness -- walls always render as a bare 1px
+# centerline regardless of this value (see segment_pixels_for_draw(),
+# which has no thickness concept at all: an earlier version banded the
+# rendered line out to match collision's reach, which worked for a flat
+# wall but rendered a diagonal one 2-3x thicker than a flat one for no
+# reason other than its angle). This constant now ONLY feeds the
+# collision reach (BALL_RADIUS + WALL_HALF_THICKNESS, see
+# _wall_contact()), controlling how far from that always-thin rendered
+# line the ball's edge settles.
+#
+# There is no value that's simultaneously flush (0px gap) AND
+# clip-proof at every angle, at this ball's small (2px) radius: the
+# wall's Bresenham-rasterized line and the ball's own rounded sprite
+# anchor each carry their own sub-pixel rounding error against the TRUE
+# continuous collision math, worse on a diagonal wall than a flat one,
+# so a flush fit always leaves SOME chance of the ball's rendered edge
+# clipping a pixel into the wall under the wrong angle/speed/approach
+# combination (confirmed directly via fuzz testing). Priority here is
+# flush over clip-proof (explicit choice, the alternative -- a
+# consistent ~1-2px gap at 2.0, fully clip-proof -- was tried and
+# rejected): 1.4 is the highest value that still rests the ball flush
+# (0px gap) against a flat wall in testing, which also happens to
+# minimize the clip rate among the flush-fitting values (clipped in
+# ~0.3% of several thousand fuzzed approach trials, vs ~24% back at the
+# first value tried here, 0.4) -- rare, not eliminated.
+WALL_HALF_THICKNESS = 1.4
 
 MAX_SPEED = 3
 # Each frame, vel_x closes this fraction of the gap to tilt*MAX_SPEED (its
@@ -216,8 +237,21 @@ del _dx, _dy
 
 
 def ball_pixels_at(cx, cy):
-    px = int(cx)
-    py = int(cy)
+    # _round_half_up, not int() (truncation/floor) -- floor always anchors
+    # the rendered footprint to the LEFT of the true continuous center,
+    # by up to just under a pixel depending on cx's fractional part. That
+    # bias is invisible most of the time, but it's exactly why a wall
+    # approached from one side rested with a clean 0px gap while the
+    # SAME wall approached from the other side let the ball's rendered
+    # pixels overlap it by a full pixel: floor() under-reaches on the
+    # right (gap) and over-reaches on the left (overlap) by the same
+    # fractional amount, in opposite directions. Rounding to the nearest
+    # pixel instead centers the bias at +-0.5px either way instead of
+    # 0/-1, which is what actually lets a small WALL_HALF_THICKNESS
+    # collision buffer (see its comment) produce a clean, direction-
+    # independent fit against the wall's rendered pixel.
+    px = _round_half_up(cx)
+    py = _round_half_up(cy)
     pts = []
     for dx, dy in BALL_OFFSETS:
         x = px + dx
@@ -312,6 +346,19 @@ def update_ball_roll(direction, rotation, prev_x, prev_y, cx, cy):
 # wedge, independent of the others) stays smooth at any density but no
 # longer reads as a checkerboard.
 BALL_CHECKER_SIZE = 2
+# Slows the checker pattern's slide (see ball_accent_pixels_at() below)
+# to a visually readable creep without touching the ball's actual
+# speed/physics at all -- rotation itself still advances at the true
+# rolling rate (arc length / BALL_RADIUS, see update_ball_roll()), this
+# just scales it down ONLY for how far the accent grid slides each
+# frame. Needed because true rolling, at this ball's small radius, slides
+# the grid by close to a full BALL_CHECKER_SIZE cell (or more, at top
+# speed) every single frame -- each frame crossing a whole cell boundary
+# reads as the pattern randomly flickering rather than visibly rolling,
+# since there's nothing slower in between for the eye to track. 1.0
+# would be the true (unscaled) rolling rate; smaller is a slower-looking
+# roll. Tune directly to taste.
+BALL_CHECKER_SLIDE_SCALE = 0.3
 
 
 def ball_accent_pixels_at(cx, cy, direction, rotation):
@@ -324,10 +371,12 @@ def ball_accent_pixels_at(cx, cy, direction, rotation):
     grid almost never lines back up with the pixel grid.
 
     Instead, the grid's origin SLIDES along the direction of travel, by
-    rotation * BALL_RADIUS pixels -- which is exactly the arc length
-    rolled so far (arc length = radius * angle) -- so the pattern
-    creeps at the same rate the ball actually moves, like a tank tread.
-    This also makes the slide correctly reverse for the reverse
+    rotation * BALL_RADIUS pixels (the true rolled arc length -- arc
+    length = radius * angle) scaled down by BALL_CHECKER_SLIDE_SCALE for
+    a readable on-screen creep instead of the true rolling rate, which
+    at this ball's small radius slides the grid by close to a whole
+    checker cell every frame. This also makes the slide correctly
+    reverse for the reverse
     direction with no extra handling: shift_x/shift_y are scaled by
     direction's own (signed) ux/uy components directly, so rolling left
     (ux < 0) slides the grid the other way from rolling right on its
@@ -336,10 +385,16 @@ def ball_accent_pixels_at(cx, cy, direction, rotation):
     rotation itself only tracks how far the ball has turned, not which
     way."""
     ux, uy = direction
-    slide = rotation * BALL_RADIUS
+    slide = rotation * BALL_RADIUS * BALL_CHECKER_SLIDE_SCALE
     shift_x = math.floor(slide * ux)
     shift_y = math.floor(slide * uy)
-    px, py = int(cx), int(cy)
+    # Must match ball_pixels_at()'s anchor exactly -- these accent pixels
+    # are drawn on top of the base ball sprite, using the same
+    # BALL_OFFSETS shape, so a different anchor here shifts the whole
+    # checker pattern by a pixel relative to where the ball itself is
+    # actually drawn, poking accent pixels out past the ball's own
+    # rendered edge instead of staying inside it.
+    px, py = _round_half_up(cx), _round_half_up(cy)
     pts = []
     for dx, dy in BALL_OFFSETS:
         cell = math.floor((dx - shift_x) / BALL_CHECKER_SIZE) + math.floor((dy - shift_y) / BALL_CHECKER_SIZE)
@@ -411,10 +466,24 @@ def _round_half_up(v):
 
 def segment_pixels_for_draw(seg):
     """The on-screen pixels for one (x0, y0, x1, y1) segment's centerline
-    -- used to render both spinner bars and walls, which share this exact
-    rasterization. Collision is never based on this: it's always exact
-    point-segment geometry against the continuous segment coordinates
-    (see _wall_contact()/_bar_contact())."""
+    -- used to render both spinner bars and walls, always a bare 1px
+    line regardless of either one's collision half-thickness
+    (BAR_HALF_THICKNESS/WALL_HALF_THICKNESS).
+
+    An earlier version of this banded the line out to match whichever
+    half-thickness collision was using, so the ball's edge (which rests
+    at BALL_RADIUS + half_thickness from the centerline, not AT the
+    centerline) would never find a gap between itself and the nearest
+    drawn pixel. That worked for an axis-aligned wall, where a
+    neighboring pixel one step off the centerline really is 1 full unit
+    away -- but a diagonal line passes much closer to its OWN off-
+    centerline neighbors (as close as sin(angle) per step), so the same
+    band distance that stayed a thin line on a flat wall pulled in extra
+    rows/columns along anything diagonal, rendering 2-3x thicker than a
+    flat wall for no reason other than its angle. Rendering is simpler
+    and more predictable just always drawing the bare line and instead
+    giving collision a little its own slack to round into -- see
+    WALL_HALF_THICKNESS's comment for how that's done without a gap."""
     x0, y0, x1, y1 = seg
     pts = set()
     x0i, y0i = int(_round_half_up(x0)), int(_round_half_up(y0))
